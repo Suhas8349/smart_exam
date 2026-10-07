@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Recordings — {{ exam_id }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<style>
+  .recording-card { margin-bottom: 20px; }
+  .recording-card .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 14px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .recording-card .student-meta { line-height: 1.5; }
+  .recording-card .student-meta .name { font-weight: 700; font-size: 15px; }
+  .recording-card .student-meta .sub { color: var(--text-muted); font-size: 13px; }
+  .recording-card video {
+    width: 100%;
+    border-radius: 8px;
+    background: #000;
+    display: block;
+  }
+  .recording-card .missing-note {
+    padding: 14px;
+    border-radius: 8px;
+    background: var(--danger-bg, #fdeef1);
+    color: var(--danger, #e0405c);
+    font-size: 13.5px;
+  }
+</style>
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('admin_dashboard') }}">Dashboard</a>
+    <a href="{{ url_for('admin_live') }}">Live Monitoring</a>
+    <a href="{{ url_for('admin_logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page">
+
+  <div class="page-header">
+    <div class="eyebrow">Session Recordings</div>
+    <h1>Exam <span class="code-tag">{{ exam_id }}</span>{% if subject_name %} — {{ subject_name }}{% endif %}</h1>
+    <p class="desc">Webcam recordings captured during this exam, one per student who completed it. Play directly or download.</p>
+  </div>
+
+  {% if entries %}
+    {% for e in entries %}
+    <div class="card recording-card">
+      <div class="head">
+        <div class="student-meta">
+          <div class="name">{{ e.student_name }}{% if e.student_id %} <span class="code-tag">{{ e.student_id }}</span>{% endif %}</div>
+          <div class="sub">
+            {% if e.student_email %}{{ e.student_email }} &middot; {% endif %}
+            {% if e.subject_name %}{{ e.subject_name }} &middot; {% endif %}
+            {% if e.submitted_at %}Submitted {{ e.submitted_at }}{% endif %}
+            {% if e.percentage != "" %} &middot; Score {{ e.percentage }}%{% endif %}
+            {% if e.exam_status %} &middot; {{ e.exam_status }}{% endif %}
+          </div>
+        </div>
+        {% if e.filename %}
+        <a href="{{ url_for('admin_download_recording', filename=e.filename) }}" class="btn btn-secondary btn-sm">Download</a>
+        {% endif %}
+      </div>
+
+      {% if e.filename %}
+      <video controls preload="metadata">
+        <source src="{{ url_for('admin_stream_recording', filename=e.filename) }}" type="video/webm">
+        Your browser does not support video playback.
+      </video>
+      {% elif e.recording_missing %}
+      <div class="missing-note">A recording was recorded for this attempt but the file could not be found — it may still be syncing, or was lost.</div>
+      {% else %}
+      <div class="missing-note">No recording was saved for this attempt.</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  {% else %}
+  <div class="card empty-state">
+    <div class="icon">🎥</div>
+    <p>No students have completed this exam yet.</p>
+  </div>
+  {% endif %}
+
+</div>
+
+</body>
+</html>

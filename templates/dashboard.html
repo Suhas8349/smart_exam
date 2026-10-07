@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Teacher Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <span style="color: var(--text-muted); font-size: 14px;">{{ session.get('teacher_name', '') }}</span>
+    <a href="{{ url_for('create_exam') }}">New Exam</a>
+    <a href="{{ url_for('logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page wide">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-end;">
+    <div>
+      <div class="eyebrow">Instructor Dashboard</div>
+      <h1>Your Exams</h1>
+      <p class="desc">Manage the exams you've created and review results.</p>
+    </div>
+    <a href="{{ url_for('create_exam') }}" class="btn btn-primary">+ Create Exam</a>
+  </div>
+
+  {% if exams %}
+  <div class="table-card">
+    <table>
+      <tr>
+        <th>Exam ID</th>
+        <th>Subject</th>
+        <th>Questions</th>
+        <th></th>
+      </tr>
+      {% for exam in exams %}
+      <tr>
+        <td><span class="code-tag">{{ exam.exam_id }}</span></td>
+        <td>{{ exam.subject_name }} <span style="color: var(--text-dim);">({{ exam.subject_code }})</span></td>
+        <td>{{ exam.question_count }}</td>
+        <td><a href="{{ url_for('teacher_exam_results', exam_id=exam.exam_id) }}" class="btn btn-secondary btn-sm">View Results</a></td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <div class="card empty-state">
+    <div class="icon">📝</div>
+    <p>You haven't created any exams yet.</p>
+    <a href="{{ url_for('create_exam') }}" class="btn btn-primary" style="margin-top: 10px;">Create your first exam</a>
+  </div>
+  {% endif %}
+
+</div>
+
+</body>
+</html>

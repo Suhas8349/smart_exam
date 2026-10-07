@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Create Exam</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/exam_system_fixed.css') }}">
+<style>
+  .q-block { position: relative; }
+  .q-block .q-num-tag {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 12px;
+    display: block;
+  }
+  .options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 4px; }
+  .correct-select { max-width: 220px; }
+  .sticky-submit {
+    position: sticky;
+    bottom: 0;
+    background: var(--bg);
+    padding: 18px 0;
+    border-top: 1px solid var(--border);
+    margin-top: 10px;
+    display: none;
+  }
+  .sticky-submit.visible { display: block; }
+  #questionsContainer { display: none; }
+  #questionsContainer.visible { display: block; }
+  .count-row { display: flex; gap: 14px; align-items: flex-end; }
+  .count-row .form-group { flex: 1; margin-bottom: 0; }
+  .count-row button { white-space: nowrap; }
+  .timing-note {
+    font-size: 12.5px;
+    color: var(--text-dim);
+    margin-top: -8px;
+    margin-bottom: 18px;
+  }
+  input[type="datetime-local"]{color-scheme:dark;accent-color:var(--accent);}
+  input[type="datetime-local"]::-webkit-calendar-picker-indicator{opacity:1;cursor:pointer;filter:invert(.86) sepia(.12) saturate(1.2);}
+  .exam-duration-card .duration-input-wrap{display:flex;align-items:stretch;}
+  .exam-duration-card .duration-input-wrap input{flex:1;min-width:0;border-radius:8px 0 0 8px;}
+  .exam-duration-card .duration-input-wrap span{display:flex;align-items:center;padding:0 13px;border:1px solid var(--border);border-left:0;border-radius:0 8px 8px 0;color:var(--text-dim);background:rgba(255,255,255,.035);font-size:13px;}
+  .duration-help{display:flex;flex-direction:column;justify-content:flex-end;}
+</style>
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+    <a href="{{ url_for('logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="page-header">
+    <div class="eyebrow">New Exam</div>
+    <h1>Create Exam</h1>
+    <p class="desc">Set up the subject details, choose how many questions you need, then fill them in below.</p>
+  </div>
+
+  <form method="POST" id="examForm">
+
+    <div class="card">
+      <div class="form-row">
+        <div class="form-group">
+          <label for="subject_name">Subject Name</label>
+            <select id="subject_name" name="subject_name" required>
+            {% for s in fixed_subjects %}
+              {% if s == 'Default (Manual Questions)' %}
+            <option value="{{ s }}" selected>{{ s }} — write questions yourself</option>
+              {% else %}
+            <option value="{{ s }}">{{ s }} — AI</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+          <div id="subjectModeNote" class="timing-note" style="margin-top: 8px; margin-bottom: 0;">
+            Default is manual-only. Choose one of the AI-supported subjects to enable AI question generation.
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="subject_code">Subject Code</label>
+          <input type="text" id="subject_code" name="subject_code" list="subjectCodeList" autocomplete="off" required>
+          <datalist id="subjectCodeList">
+            {% for s in existing_subjects %}
+            <option value="{{ s.subject_code }}">{{ s.subject_name }}</option>
+            {% endfor %}
+          </datalist>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="card">
+      <div class="form-group">
+        <label>Exam Availability Window <span style="color: var(--text-dim); font-weight: 400;">(optional)</span></label>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="available_from">Available From</label>
+          <input type="datetime-local" id="available_from" name="available_from">
+        </div>
+        <div class="form-group">
+          <label for="available_until">Available Until</label>
+          <input type="datetime-local" id="available_until" name="available_until">
+        </div>
+      </div>
+      <div class="timing-note">Leave both blank to make the exam available at any time. If set, students can only start the exam within this window.</div>
+    </div>
+
+    <div class="card exam-duration-card">
+      <div class="form-row">
+        <div class="form-group">
+          <label for="duration_minutes">Exam Duration</label>
+          <div class="duration-input-wrap">
+            <input type="number" id="duration_minutes" name="duration_minutes" min="1" max="480" value="30" required>
+            <span>minutes</span>
+          </div>
+        </div>
+        <div class="form-group duration-help">
+          <label>Automatic time sync</label>
+          <div class="timing-note" style="margin:0;">Changing From and Until recalculates the duration. Changing the duration recalculates the other endpoint.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="count-row">
+        <div class="form-group">
+          <label for="num_questions">Number of Questions</label>
+          <input type="number" id="num_questions" min="1" max="100" placeholder="e.g. 10" required>
+        </div>
+        <button type="button" id="generateBtn" class="btn btn-secondary">Add Blank Questions</button>
+      </div>
+
+      <div class="timing-note" style="margin-top: 18px; margin-bottom: 6px;">
+        For one of the AI-supported subjects, AI can generate the questions and correct answers automatically. You can review and edit every question before creating the exam. The Default subject is manual-only.
+      </div>
+
+      <div class="count-row" style="align-items: flex-end;">
+        <div class="form-group">
+          <label for="ai_difficulty">Difficulty</label>
+          <select id="ai_difficulty">
+            <option value="easy">Easy</option>
+            <option value="medium" selected>Medium</option>
+            <option value="hard">Hard</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex: 2;">
+          <label for="ai_notes">Notes for the AI <span style="color: var(--text-dim); font-weight: 400;">(optional)</span></label>
+          <input type="text" id="ai_notes" placeholder="e.g. focus on chapters 3–5, avoid numerical problems">
+        </div>
+        <button type="button" id="aiGenerateBtn" class="btn btn-primary">Generate with AI</button>
+      </div>
+      <div id="aiStatus" class="timing-note" style="display:none;"></div>
+    </div>
+
+    <input type="hidden" name="num_questions" id="num_questions_hidden">
+
+    <div id="questionsContainer"></div>
+
+    <div class="sticky-submit" id="submitBar">
+      <button type="submit" class="btn btn-primary btn-block">Create Exam</button>
+    </div>
+
+  </form>
+
+</div>
+
+<script>
+const generateBtn = document.getElementById('generateBtn');
+const numQuestionsInput = document.getElementById('num_questions');
+const numQuestionsHidden = document.getElementById('num_questions_hidden');
+const container = document.getElementById('questionsContainer');
+const submitBar = document.getElementById('submitBar');
+
+function questionBlockHTML(i, total) {
+  return `
+    <div class="card q-block">
+      <span class="q-num-tag">Question ${i} / ${total}</span>
+
+      <div class="form-group">
+        <label for="question_${i}">Question Text</label>
+        <textarea id="question_${i}" name="question_${i}" rows="2" required></textarea>
+      </div>
+
+      <div class="options-grid">
+        <div class="form-group">
+          <label for="option_a_${i}">Option A</label>
+          <input type="text" id="option_a_${i}" name="option_a_${i}" required>
+        </div>
+        <div class="form-group">
+          <label for="option_b_${i}">Option B</label>
+          <input type="text" id="option_b_${i}" name="option_b_${i}" required>
+        </div>
+        <div class="form-group">
+          <label for="option_c_${i}">Option C</label>
+          <input type="text" id="option_c_${i}" name="option_c_${i}" required>
+        </div>
+        <div class="form-group">
+          <label for="option_d_${i}">Option D</label>
+          <input type="text" id="option_d_${i}" name="option_d_${i}" required>
+        </div>
+      </div>
+
+      <div class="form-group correct-select">
+        <label for="correct_${i}">Correct Answer</label>
+        <select id="correct_${i}" name="correct_${i}" required>
+          <option value="">Select</option>
+          <option value="A">A</option>
+          <option value="B">B</option>
+          <option value="C">C</option>
+          <option value="D">D</option>
+        </select>
+      </div>
+    </div>
+  `;
+}
+
+function buildBlankBlocks(n) {
+  numQuestionsHidden.value = n;
+
+  let html = '';
+  for (let i = 1; i <= n; i++) {
+    html += questionBlockHTML(i, n);
+  }
+  container.innerHTML = html;
+  container.classList.add('visible');
+  submitBar.classList.add('visible');
+
+  container.scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function confirmReplaceIfNeeded() {
+  if (container.children.length === 0) return true;
+  return confirm('This will replace any questions already filled in below. Continue?');
+}
+
+generateBtn.addEventListener('click', () => {
+  const n = parseInt(numQuestionsInput.value, 10);
+
+  if (!n || n < 1 || n > 100) {
+    alert('Enter a number of questions between 1 and 100.');
+    return;
+  }
+
+  if (!confirmReplaceIfNeeded()) return;
+
+  buildBlankBlocks(n);
+});
+
+// ===================== DATE/TIME <-> DURATION SYNC =====================
+const availableFromInput=document.getElementById('available_from');
+const availableUntilInput=document.getElementById('available_until');
+const durationInput=document.getElementById('duration_minutes');
+let syncingExamTime=false;
+function readLocalDate(i){if(!i||!i.value)return null;const d=new Date(i.value);return Number.isNaN(d.getTime())?null:d;}
+function fmtLocal(d){const p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;}
+function syncDurationFromWindow(){if(syncingExamTime)return;const f=readLocalDate(availableFromInput),u=readLocalDate(availableUntilInput);if(!f||!u)return;const m=Math.round((u-f)/60000);if(m>0){syncingExamTime=true;durationInput.value=m;syncingExamTime=false;}}
+function syncWindowFromDuration(){if(syncingExamTime)return;const m=parseInt(durationInput?.value,10);if(!m||m<1)return;const f=readLocalDate(availableFromInput),u=readLocalDate(availableUntilInput);syncingExamTime=true;if(f)availableUntilInput.value=fmtLocal(new Date(f.getTime()+m*60000));else if(u)availableFromInput.value=fmtLocal(new Date(u.getTime()-m*60000));syncingExamTime=false;}
+availableFromInput?.addEventListener('change',()=>{if(readLocalDate(availableUntilInput))syncDurationFromWindow();else syncWindowFromDuration();});
+availableUntilInput?.addEventListener('change',()=>{if(readLocalDate(availableFromInput))syncDurationFromWindow();else syncWindowFromDuration();});
+durationInput?.addEventListener('input',syncWindowFromDuration);durationInput?.addEventListener('change',syncWindowFromDuration);
+
+// ===================== AI QUESTION GENERATION =====================
+const aiGenerateBtn = document.getElementById('aiGenerateBtn');
+const aiDifficulty = document.getElementById('ai_difficulty');
+const aiNotes = document.getElementById('ai_notes');
+const aiStatus = document.getElementById('aiStatus');
+const subjectNameInput = document.getElementById('subject_name');
+const subjectModeNote = document.getElementById('subjectModeNote');
+const MANUAL_SUBJECT = 'Default (Manual Questions)';
+
+function setAiStatus(message, isError) {
+  aiStatus.style.display = 'block';
+  aiStatus.textContent = message;
+  aiStatus.style.color = isError ? 'var(--danger)' : 'var(--text-dim)';
+}
+
+function updateSubjectMode() {
+  const manual = subjectNameInput.value === MANUAL_SUBJECT;
+
+  aiGenerateBtn.disabled = manual;
+  aiGenerateBtn.title = manual
+    ? 'This subject is manual-only.'
+    : 'Generate questions with AI';
+
+  if (manual) {
+    subjectModeNote.textContent =
+      'Manual-only mode: use “Add Blank Questions” and write all questions yourself.';
+    subjectModeNote.style.color = 'var(--text-dim)';
+    aiStatus.style.display = 'none';
+  } else {
+    subjectModeNote.textContent =
+      'AI mode: Gemini will generate questions and the correct answers automatically. Review/edit them before creating the exam.';
+    subjectModeNote.style.color = 'var(--text-dim)';
+  }
+}
+
+subjectNameInput.addEventListener('change', updateSubjectMode);
+updateSubjectMode();
+
+aiGenerateBtn.addEventListener('click', async () => {
+  const n = parseInt(numQuestionsInput.value, 10);
+  const subject = subjectNameInput.value.trim();
+
+  if (subject === MANUAL_SUBJECT) {
+    setAiStatus('Manual-only subject selected. Use “Add Blank Questions” to enter the questions yourself.', true);
+    return;
+  }
+
+  if (!subject) {
+    alert('Enter a subject name first — the AI needs to know what topic to write questions about.');
+    subjectNameInput.focus();
+    return;
+  }
+
+  if (!n || n < 1 || n > 100) {
+    alert('Enter a number of questions between 1 and 100.');
+    numQuestionsInput.focus();
+    return;
+  }
+
+  if (!confirmReplaceIfNeeded()) return;
+
+  aiGenerateBtn.disabled = true;
+  aiGenerateBtn.textContent = 'Generating…';
+  setAiStatus('Asking the AI to draft ' + n + ' question(s) on "' + subject + '"…', false);
+
+  try {
+    const res = await fetch("{{ url_for('ai_generate_questions') }}", {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        subject_name: subject,
+        num_questions: n,
+        difficulty: aiDifficulty.value,
+        notes: aiNotes.value.trim()
+      })
+    });
+
+    let data;
+    try {
+      data = await res.json();
+    } catch (_) {
+      throw new Error('The server returned an unexpected response. Check the Flask/Spyder console for the exact error.');
+    }
+
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || ('AI generation failed (HTTP ' + res.status + ').'));
+    }
+
+    const questions = data.questions;
+
+    // Build blank blocks first (same as the manual button), then fill
+    // in the values — so the result is still just normal editable
+    // form fields the teacher can review, fix, or overwrite by hand.
+    buildBlankBlocks(questions.length);
+
+    questions.forEach((q, idx) => {
+      const i = idx + 1;
+      document.getElementById(`question_${i}`).value = q.question || '';
+      document.getElementById(`option_a_${i}`).value = q.option_a || '';
+      document.getElementById(`option_b_${i}`).value = q.option_b || '';
+      document.getElementById(`option_c_${i}`).value = q.option_c || '';
+      document.getElementById(`option_d_${i}`).value = q.option_d || '';
+      document.getElementById(`correct_${i}`).value = q.correct_answer || '';
+    });
+
+    setAiStatus('Generated ' + questions.length + ' question(s) — review and edit them below before creating the exam.', false);
+
+  } catch (e) {
+    console.error(e);
+    setAiStatus(e.message || 'AI generation failed. You can still add questions manually.', true);
+  } finally {
+    aiGenerateBtn.disabled = false;
+    aiGenerateBtn.textContent = 'Generate with AI';
+  }
+});
+</script>
+
+</body>
+</html>

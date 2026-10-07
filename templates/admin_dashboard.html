@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Admin Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('admin_live') }}">Live Monitoring</a>
+    <span style="color: var(--text-muted); font-size: 14px;">{{ session.get('admin_name', '') }}</span>
+    <a href="{{ url_for('admin_logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page wide">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="page-header">
+    <div class="eyebrow">Oversight Dashboard</div>
+    <h1>All Subjects</h1>
+    <p class="desc">Monitor every subject, its instructors, and exam activity across the system.</p>
+  </div>
+
+  {% if subjects %}
+  <div class="table-card">
+    <table>
+      <tr>
+        <th>Subject</th>
+        <th>Instructors</th>
+        <th>Exams Held</th>
+        <th></th>
+      </tr>
+      {% for s in subjects %}
+      <tr>
+        <td>{{ s.subject_name }} <span class="code-tag">{{ s.subject_code }}</span></td>
+        <td>{{ s.teacher_names }}</td>
+        <td>{{ s.exam_ids|length }}</td>
+        <td>
+          <a href="{{ url_for('admin_subject_results', subject_code=s.subject_code) }}" class="btn btn-secondary btn-sm">Results</a>
+          <a href="{{ url_for('admin_download_subject_results', subject_code=s.subject_code) }}" class="btn btn-secondary btn-sm">Download</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <div class="card empty-state">
+    <div class="icon">🗂️</div>
+    <p>No subjects created yet.</p>
+  </div>
+  {% endif %}
+
+</div>
+
+</body>
+</html>

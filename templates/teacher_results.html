@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Exam Results — {{ subject_name }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<style>
+  .student-row { cursor: pointer; }
+  .details-panel { display: none; background: var(--surface-2); padding: 16px 18px; }
+  .details-panel.open { display: table-row; }
+  .details-panel td { border-bottom: 1px solid var(--border); }
+  .mini-table { width: 100%; margin-top: 4px; }
+  .mini-table th, .mini-table td { padding: 8px 10px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+    <a href="{{ url_for('logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page wide">
+
+  <div class="page-header" style="display:flex; justify-content:space-between; align-items:flex-end;">
+    <div>
+      <div class="eyebrow">Exam <span class="code-tag">{{ exam_id }}</span></div>
+      <h1>{{ subject_name }} <span style="color: var(--text-dim); font-weight:400;">({{ subject_code }})</span></h1>
+      <p class="desc">{{ student_results|length }} student(s) attempted this exam.</p>
+    </div>
+    <a href="{{ url_for('download_exam_results', exam_id=exam_id) }}" class="btn btn-secondary">Download Results (.xlsx)</a>
+  </div>
+
+  {% if student_results %}
+  <div class="table-card">
+    <table>
+      <tr>
+        <th>Student</th>
+        <th>Score</th>
+        <th>Percentage</th>
+        <th></th>
+      </tr>
+      {% for r in student_results %}
+      <tr class="student-row" onclick="toggleDetails('{{ r.result_id }}')">
+        <td>{{ r.student_name }} <span style="color: var(--text-dim); font-size: 12.5px;">({{ r.student_id }})</span></td>
+        <td>{{ r.score }}</td>
+        <td>
+          <span class="badge {{ 'badge-success' if r.percentage|float >= 50 else 'badge-danger' }}">{{ r.percentage }}%</span>
+        </td>
+        <td style="color: var(--accent); font-size: 13px;">View ▾</td>
+      </tr>
+      <tr class="details-panel" id="panel-{{ r.result_id }}">
+        <td colspan="4">
+          <table class="mini-table">
+            <tr>
+              <th>#</th><th>Question</th><th>Answer</th><th>Correct</th><th>Status</th>
+            </tr>
+            {% for d in details.get(r.result_id, []) %}
+            <tr>
+              <td>{{ d.question_number }}</td>
+              <td>{{ d.question }}</td>
+              <td>{{ d.student_answer }}</td>
+              <td>{{ d.correct_answer }}</td>
+              <td><span class="badge {{ 'badge-success' if d.status == 'Correct' else 'badge-danger' }}">{{ d.status }}</span></td>
+            </tr>
+            {% endfor %}
+          </table>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <div class="card empty-state">
+    <div class="icon">📊</div>
+    <p>No students have attempted this exam yet.</p>
+  </div>
+  {% endif %}
+
+</div>
+
+<script>
+function toggleDetails(id) {
+  const panel = document.getElementById('panel-' + id);
+  panel.classList.toggle('open');
+}
+</script>
+
+</body>
+</html>

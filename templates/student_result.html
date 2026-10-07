@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Exam Result</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/exam_system_fixed.css') }}">
+  <style>
+    html, body { min-height:100%; background:#0a0e1a !important; }
+    body { min-height:100vh; margin:0; font-family:Segoe UI,Arial,sans-serif; }
+    .result-page { max-width:1000px; margin:0 auto; padding:38px 22px 70px; }
+    .result-hero { text-align:center; margin-bottom:26px; }
+    .result-hero .eyebrow { color:#9d85ff; font:700 11px monospace; letter-spacing:.14em; text-transform:uppercase; }
+    .result-hero h1 { margin:8px 0 8px; color:#f1f0f7; font-size:34px; }
+    .result-hero p { color:#b7b3cc; margin:0; }
+    .result-summary { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:24px 0; }
+    .result-stat { background:#141a2c; border:1px solid rgba(255,255,255,.10); border-radius:14px; padding:18px; text-align:center; }
+    .result-stat .value { font-size:30px; font-weight:800; color:#f1f0f7; }
+    .result-stat .label { margin-top:5px; font-size:12px; color:#b7b3cc; }
+    .result-stat.correct .value { color:#4ade80; }
+    .result-stat.wrong .value { color:#f87171; }
+    .result-stat.unattempted .value { color:#fbbf24; }
+    .result-stat.score .value { color:#9d85ff; }
+    .result-card { background:#141a2c; border:1px solid rgba(255,255,255,.10); border-radius:14px; overflow:hidden; }
+    .result-card-header { padding:17px 20px; border-bottom:1px solid rgba(255,255,255,.10); color:#f1f0f7; font-weight:700; }
+    .result-question { padding:19px 20px; border-bottom:1px solid rgba(255,255,255,.08); }
+    .result-question:last-child { border-bottom:0; }
+    .q-top { display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }
+    .q-number { color:#9d85ff; font:700 12px monospace; }
+    .q-text { margin:7px 0 12px; color:#f1f0f7; font-size:16px; line-height:1.5; }
+    .answer-line { color:#b7b3cc; font-size:13px; line-height:1.7; }
+    .answer-line strong { color:#f1f0f7; }
+    .status { padding:5px 10px; border-radius:999px; font-size:11px; font-weight:800; white-space:nowrap; }
+    .status.correct { color:#86efac; background:rgba(74,222,128,.12); }
+    .status.wrong { color:#fca5a5; background:rgba(248,113,113,.12); }
+    .status.unattempted { color:#fcd34d; background:rgba(251,191,36,.12); }
+    @media (max-width:720px) { .result-summary { grid-template-columns:1fr 1fr; } .q-top { flex-direction:column; } }
+  </style>
+</head>
+<body>
+  <div class="result-page">
+    <div class="result-hero">
+      <div class="eyebrow">ExamGuard · Result</div>
+      <h1>{{ subject_name }}</h1>
+      <p>Result ID: {{ result_id }} · Exam ID: {{ exam_id }}</p>
+      {% if exam_status == 'Time Expired — Auto Submitted' %}
+        <div style="display:inline-block;margin-top:10px;padding:7px 12px;border-radius:999px;background:rgba(251,191,36,.12);border:1px solid rgba(251,191,36,.35);color:#fcd34d;font-size:12px;font-weight:800;">⏱ Time expired — answers saved automatically</div>
+      {% endif %}
+    </div>
+
+    <div class="result-summary">
+      <div class="result-stat correct"><div class="value">{{ correct_count }}</div><div class="label">Correct</div></div>
+      <div class="result-stat wrong"><div class="value">{{ wrong_count }}</div><div class="label">Wrong</div></div>
+      <div class="result-stat unattempted"><div class="value">{{ unattempted_count }}</div><div class="label">Unattempted</div></div>
+      <div class="result-stat score"><div class="value">{{ percentage }}%</div><div class="label">Score</div></div>
+    </div>
+
+    <div class="result-card">
+      <div class="result-card-header">Question-wise Result · {{ total_questions }} Questions <span style="float:right;color:#8b87a3;font-size:11px;font-weight:600;">READ-ONLY</span></div>
+      {% for q in questions %}
+        <div class="result-question">
+          <div class="q-top">
+            <div>
+              <div class="q-number">QUESTION {{ q.number }}</div>
+              <div class="q-text">{{ q.question }}</div>
+            </div>
+            {% if q.status == 'Correct' %}
+              <span class="status correct">Correct</span>
+            {% elif q.status == 'Unattempted' %}
+              <span class="status unattempted">Unattempted</span>
+            {% else %}
+              <span class="status wrong">Wrong</span>
+            {% endif %}
+          </div>
+          <div class="answer-line"><strong>Your answer:</strong> {{ q.selected_answer }}</div>
+          <div class="answer-line"><strong>Correct answer:</strong> {{ q.correct_answer }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+
+  <style>
+    #result-unlock-panel {
+      position: fixed;
+      left: 50%;
+      bottom: 22px;
+      transform: translateX(-50%);
+      z-index: 2147483647;
+      width: min(520px, calc(100vw - 32px));
+      background: rgba(12,16,28,.97);
+      border: 1px solid rgba(157,133,255,.45);
+      border-radius: 14px;
+      box-shadow: 0 14px 45px rgba(0,0,0,.5);
+      padding: 16px 18px;
+      color: #f1f0f7;
+      font-family: Segoe UI, Arial, sans-serif;
+    }
+    #result-unlock-panel .title {
+      font-weight: 800;
+      font-size: 15px;
+      margin-bottom: 5px;
+    }
+    #result-unlock-panel .help {
+      color: #b7b3cc;
+      font-size: 12.5px;
+      line-height: 1.45;
+      margin-bottom: 11px;
+    }
+    #result-unlock-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    #result-unlock-password {
+      flex: 1;
+      min-width: 0;
+      background: #0a0e1a;
+      color: #f1f0f7;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 9px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+    }
+    #result-unlock-password:focus {
+      border-color: #9d85ff;
+      box-shadow: 0 0 0 3px rgba(157,133,255,.16);
+    }
+    #result-unlock-btn {
+      border: 0;
+      border-radius: 9px;
+      padding: 10px 15px;
+      background: #9d85ff;
+      color: #fff;
+      font-weight: 800;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #result-unlock-btn:hover { filter: brightness(1.06); }
+    #result-unlock-status {
+      margin-top: 9px;
+      font-size: 12px;
+      color: #fbbf24;
+      min-height: 18px;
+    }
+    #result-keyboard-pill {
+      position: fixed;
+      top: 16px;
+      right: 18px;
+      z-index: 2147483647;
+      background: #2c1616;
+      color: #fca5a5;
+      border: 1px solid #5c2a2a;
+      border-radius: 999px;
+      padding: 7px 13px;
+      font: 700 12px Segoe UI, Arial, sans-serif;
+    }
+    #result-keyboard-pill.unlocked {
+      background: #12351f;
+      color: #86efac;
+      border-color: #2f7a49;
+    }
+    @media (max-width: 620px) {
+      #result-unlock-row { flex-direction: column; align-items: stretch; }
+      #result-unlock-btn { width: 100%; }
+    }
+  </style>
+
+  <div id="result-keyboard-pill">🔒 Keyboard: Locked</div>
+  <div id="result-unlock-panel" aria-label="Teacher result unlock">
+    <div class="title">Exam completed — teacher unlock</div>
+    <div class="help">
+      Enter the authorized teacher password, then press <strong>Unlock</strong>.
+      This unlocks the keyboard and requests exit from browser fullscreen.
+    </div>
+    <div id="result-unlock-row">
+      <input id="result-unlock-password" type="password" autocomplete="off"
+             placeholder="Teacher unlock password" aria-label="Teacher unlock password">
+      <button id="result-unlock-btn" type="button">Unlock</button>
+    </div>
+    <div id="result-unlock-status">Status: Locked</div>
+  </div>
+
+  <script>
+  (() => {
+    const examId = {{ exam_id|tojson }};
+    const input = document.getElementById('result-unlock-password');
+    const button = document.getElementById('result-unlock-btn');
+    const status = document.getElementById('result-unlock-status');
+    const pill = document.getElementById('result-keyboard-pill');
+    const panel = document.getElementById('result-unlock-panel');
+
+    function setStatus(message, ok=false) {
+      status.textContent = message;
+      status.style.color = ok ? '#86efac' : '#fbbf24';
+    }
+
+    async function unlock() {
+      const password = input.value;
+      if (!password) {
+        setStatus('Status: Enter the teacher password first.');
+        input.focus();
+        return;
+      }
+
+      button.disabled = true;
+      button.textContent = 'Checking...';
+      setStatus('Status: Checking password...');
+
+      try {
+        const response = await fetch('/student/exam/keyboard-unlock', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
+          body: JSON.stringify({password, exam_id: examId})
+        });
+        const data = await response.json();
+
+        if (data && data.unlocked) {
+          pill.textContent = '🔓 Keyboard: Unlocked';
+          pill.classList.add('unlocked');
+          setStatus('Status: Unlocked. You may now use the keyboard.', true);
+          input.value = '';
+          button.textContent = 'Unlocked';
+          button.disabled = true;
+
+          // Exit the web-page fullscreen layer. This works when the browser
+          // was started in normal fullscreen mode (--start-fullscreen) or
+          // the page itself entered fullscreen. Edge --kiosk deliberately
+          // blocks leaving kiosk fullscreen, so keyboard unlock still works
+          // there but the browser itself remains in kiosk mode.
+          try {
+            if (document.fullscreenElement && document.exitFullscreen) {
+              await document.exitFullscreen();
+            }
+          } catch (e) {
+            console.warn('Fullscreen exit was blocked by the browser:', e);
+          }
+
+          panel.style.borderColor = 'rgba(74,222,128,.45)';
+          setTimeout(() => panel.remove(), 1800);
+        } else {
+          setStatus('Status: Incorrect password.');
+          input.select();
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus('Status: Could not verify the password. Check that student_app.py is running.');
+      } finally {
+        if (!button.disabled) {
+          button.disabled = false;
+          button.textContent = 'Unlock';
+        }
+      }
+    }
+
+    button.addEventListener('click', unlock);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        unlock();
+      }
+    });
+
+    // Put the cursor directly into the password box so the teacher can type
+    // immediately even though the exam keyboard was locked previously.
+    setTimeout(() => input.focus(), 100);
+  })();
+  </script>
+
+</body>
+</html>

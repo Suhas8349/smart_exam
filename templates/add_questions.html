@@ -1,0 +1,64 @@
+<h2>Exam : {{exam_id}}</h2>
+
+<h3>Question {{question_no}} / 20</h3>
+
+<form method="POST">
+
+Question
+
+<input
+type="text"
+name="question"
+required>
+
+Option A
+
+<input
+type="text"
+name="option1"
+required>
+
+Option B
+
+<input
+type="text"
+name="option2"
+required>
+
+Option C
+
+<input
+type="text"
+name="option3"
+required>
+
+Option D
+
+<input
+type="text"
+name="option4"
+required>
+
+Correct Answer
+
+<select
+name="correct_answer">
+
+<option value="A">A</option>
+
+<option value="B">B</option>
+
+<option value="C">C</option>
+
+<option value="D">D</option>
+
+</select>
+
+<br><br>
+
+<input
+type="submit"
+value="Save Question"
+class="btn">
+
+</form>

@@ -1,0 +1,30 @@
+cat >> .gitignore <<'EOF'
+
+# Exam recordings
+recordings/
+
+# Temporary recording parts
+recordings/.examguard_parts/
+
+# Generated video files
+*.webm
+
+# Large model file
+efficientdet_lite0.tflite
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Java
+target/
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+*.iml
+EOF

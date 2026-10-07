@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Online Examination System</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('index') }}">Home</a>
+    <a href="{{ url_for('login') }}">Teacher</a>
+    <a href="{{ url_for('student_login') }}">Student</a>
+  </div>
+</div>
+
+<div class="page">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="hero">
+    <div class="eyebrow">AI-Monitored Assessment Platform</div>
+    <h1>Online Examination System</h1>
+    <p>Create, deliver, and monitor exams with real-time AI-based malpractice detection — face tracking, audio monitoring, and tab-switch detection, all in one platform.</p>
+  </div>
+
+  <div class="role-grid">
+
+    <div class="role-card">
+      <div class="tag">Instructor</div>
+      <h2>Teacher</h2>
+      <p>Create exams, add questions, and review student performance.</p>
+      <div class="links">
+        <a href="{{ url_for('login') }}">Login</a>
+        <a href="{{ url_for('register') }}">Register</a>
+      </div>
+    </div>
+
+    <div class="role-card">
+      <div class="tag">Candidate</div>
+      <h2>Student</h2>
+      <p>View available subjects and attend your scheduled examinations.</p>
+      <div class="links">
+        <a href="{{ url_for('student_login') }}">Login</a>
+        <a href="{{ url_for('student_register') }}">Register</a>
+      </div>
+    </div>
+
+    <div class="role-card">
+      <div class="tag">Oversight</div>
+      <h2>Admin</h2>
+      <p>Monitor subjects, exam activity, and student performance across the system.</p>
+      <div class="links">
+        <a href="{{ url_for('admin_login') }}">Login</a>
+        <a href="{{ url_for('admin_register') }}">Register</a>
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+</html>

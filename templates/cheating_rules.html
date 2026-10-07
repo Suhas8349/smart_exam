@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<title>
+
+Exam Instructions
+
+</title>
+
+<link rel="stylesheet"
+href="{{ url_for('static',filename='style.css') }}">
+
+</head>
+
+<body>
+
+<div class="dashboard">
+
+<h1>
+
+Exam Instructions
+
+</h1>
+
+<a href="/exam/{{exam_id}}/1">
+
+<button class="btn">
+
+Back
+
+</button>
+
+</a>
+
+<br><br>
+
+<ul>
+
+<li>Exam Duration : 20 Minutes</li>
+
+<li>Total Questions : 20</li>
+
+<li>Do not switch browser tabs.</li>
+
+<li>Keep your face visible.</li>
+
+<li>Only one face should be visible.</li>
+
+<li>Maintain eye contact with the screen.</li>
+
+<li>If cheating is detected, warnings will be shown.</li>
+
+<li>After 3 warnings, the exam may be terminated.</li>
+
+<li>Exam will auto-submit after 20 minutes.</li>
+
+</ul>
+
+</div>
+
+</body>
+
+</html>

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<title>Result</title>
+
+<link rel="stylesheet"
+href="{{ url_for('static',filename='style.css') }}">
+
+</head>
+
+
+<body>
+
+
+<div class="dashboard">
+
+
+<h1>
+Exam Completed
+</h1>
+
+
+<hr>
+
+
+<h2>
+Exam ID : {{exam_id}}
+</h2>
+
+
+<h2>
+Score : {{score}} / {{total}}
+</h2>
+
+
+<h2>
+Percentage : {{percentage}} %
+</h2>
+
+
+<br>
+
+
+<a href="/student">
+
+<button class="btn">
+
+Back To Dashboard
+
+</button>
+
+</a>
+
+
+</div>
+
+
+</body>
+
+</html>

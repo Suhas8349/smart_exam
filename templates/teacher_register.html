@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<title>
+
+Teacher Registration
+
+</title>
+
+<link rel="stylesheet"
+href="{{ url_for('static',filename='style.css') }}">
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h2>
+
+Teacher Registration
+
+</h2>
+
+{% with messages=get_flashed_messages() %}
+{% if messages %}
+
+<div class="message">
+
+{% for message in messages %}
+
+<p>{{message}}</p>
+
+{% endfor %}
+
+</div>
+
+{% endif %}
+{% endwith %}
+
+<form method="POST">
+
+<label>
+
+Teacher ID
+
+</label>
+
+<input
+type="text"
+name="teacher_id"
+required>
+
+<br><br>
+
+<label>
+
+Teacher Name
+
+</label>
+
+<input
+type="text"
+name="name"
+required>
+
+<br><br>
+
+<label>
+
+Email
+
+</label>
+
+<input
+type="email"
+name="email"
+required>
+
+<br><br>
+
+<label>
+
+Subject
+
+</label>
+
+<input
+type="text"
+name="subject"
+placeholder="Example: Machine Learning"
+required>
+
+<br><br>
+
+<label>
+
+Subject Code
+
+</label>
+
+<input
+type="text"
+name="subject_code"
+placeholder="Example: ML101"
+required>
+
+<br><br>
+
+<label>
+
+Password
+
+</label>
+
+<input
+type="password"
+name="password"
+required>
+
+<br><br>
+
+<input
+type="submit"
+value="Register"
+class="btn green">
+
+</form>
+
+<br>
+
+<a href="/login">
+
+Already Registered? Login
+
+</a>
+
+</div>
+
+</body>
+
+</html>

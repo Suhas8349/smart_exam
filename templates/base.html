@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+
+    <title>Teacher Exam System</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+
+</head>
+
+<body>
+
+<nav class="navbar">
+
+    <div class="logo">
+        Online Examination System
+    </div>
+
+    <div class="nav-links">
+
+        {% if session.get("teacher_id") %}
+
+            <a href="{{ url_for('dashboard') }}">
+                Teacher Dashboard
+            </a>
+
+            <a href="{{ url_for('create_exam') }}">
+                Create Exam
+            </a>
+
+            <a href="{{ url_for('logout') }}">
+                Logout
+            </a>
+
+
+        {% elif session.get("student_id") %}
+
+            <a href="{{ url_for('student_dashboard') }}">
+                Student Dashboard
+            </a>
+
+            <a href="{{ url_for('student_logout') }}">
+                Logout
+            </a>
+
+
+        {% else %}
+
+            <a href="{{ url_for('index') }}">
+                Home
+            </a>
+
+            <a href="{{ url_for('login') }}">
+                Teacher
+            </a>
+
+            <a href="{{ url_for('student_login') }}">
+                Student
+            </a>
+
+        {% endif %}
+
+    </div>
+
+</nav>
+
+<div class="container">
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+
+        {% if messages %}
+
+            {% for category, message in messages %}
+
+                <div class="alert {{ category }}">
+                    {{ message }}
+                </div>
+
+            {% endfor %}
+
+        {% endif %}
+
+    {% endwith %}
+
+
+    {% block content %}
+
+    {% endblock %}
+
+</div>
+
+
+</body>
+
+</html>

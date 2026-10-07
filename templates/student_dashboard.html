@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Student Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <span style="color: var(--text-muted); font-size: 14px;">{{ session.get('student_name', '') }}</span>
+    <a href="{{ url_for('student_logout') }}" class="logout">Logout</a>
+  </div>
+</div>
+
+<div class="page wide">
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+
+  <div class="page-header">
+    <div class="eyebrow">Candidate Dashboard</div>
+    <h1>Available Exams</h1>
+    <p class="desc">Select a subject below to begin your examination. Your camera and microphone will be monitored throughout.</p>
+  </div>
+
+  {% if subjects %}
+  <div class="table-card">
+    <table>
+      <tr>
+        <th>Subject</th>
+        <th>Instructor</th>
+        <th>Exam ID</th>
+        <th></th>
+      </tr>
+      {% for s in subjects %}
+      <tr>
+        <td>{{ s.subject_name }} <span style="color: var(--text-dim);">({{ s.subject_code }})</span></td>
+        <td>{{ s.teacher_name }}</td>
+        <td><span class="code-tag">{{ s.exam_id }}</span></td>
+        <td><a href="{{ url_for('start_exam', exam_id=s.exam_id) }}" class="btn btn-primary btn-sm">Start Exam</a></td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% else %}
+  <div class="card empty-state">
+    <div class="icon">📭</div>
+    <p>No exams are available right now. Check back later.</p>
+  </div>
+  {% endif %}
+
+</div>
+
+</body>
+</html>

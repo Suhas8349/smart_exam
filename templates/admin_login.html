@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Admin Login</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="navbar">
+  <div class="brand"><span class="dot"></span> ExamGuard</div>
+  <div class="nav-links">
+    <a href="{{ url_for('index') }}">Home</a>
+    <a href="{{ url_for('login') }}">Teacher</a>
+  </div>
+</div>
+
+<div class="page">
+  <div class="card auth-card">
+    <div class="eyebrow">Oversight Access</div>
+    <h1>Admin Login</h1>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" style="margin-top: 20px;">
+      <div class="form-group">
+        <label for="admin_id">Admin ID</label>
+        <input type="text" id="admin_id" name="admin_id" required>
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block">Login</button>
+    </form>
+
+    <div class="switch">
+      Don't have an account? <a href="{{ url_for('admin_register') }}">Register here</a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

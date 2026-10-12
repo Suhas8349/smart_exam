@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, send_file, send_from_directory
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, session, flash, jsonify, send_file, send_from_directory
 from openpyxl import Workbook, load_workbook
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
@@ -62,7 +62,32 @@ RECORDING_ASSEMBLY_LOCK = threading.Lock()
 
 
 app = Flask(__name__)
+from flask import request, abort, render_template_string
 
+@app.before_request
+def block_mobile_devices():
+    user_agent = request.headers.get("User-Agent", "").lower()
+
+    mobile_signatures = (
+        "android", "iphone", "ipad", "ipod",
+        "mobile", "windows phone", "opera mini"
+    )
+
+    if any(signature in user_agent for signature in mobile_signatures):
+        return render_template_string("""
+            <!doctype html>
+            <html>
+            <head>
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Device Not Supported</title>
+            </head>
+            <body style="font-family:Arial;text-align:center;padding:40px">
+                <h2>Device Not Supported</h2>
+                <p>This examination can only be taken on a laptop or desktop computer.</p>
+                <p>Please open the exam on a supported computer.</p>
+            </body>
+            </html>
+        """), 403
 app.secret_key = "student_exam_system_secret_key"
 
 import socket

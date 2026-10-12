@@ -1,49 +1,91 @@
+```html
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Student Login</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Student Login</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
 
 <div class="navbar">
-  <div class="brand"><span class="dot"></span> ExamGuard</div>
-  <div class="nav-links">
-    <a href="{{ url_for('index') }}">Home</a>
-  </div>
+    <div class="brand"><span class="dot"></span> ExamGuard</div>
+    <div class="nav-links">
+        <a href="{{ url_for('index') }}">Home</a>
+    </div>
 </div>
 
 <div class="page">
-  <div class="card auth-card">
-    <div class="eyebrow">Candidate Access</div>
-    <h1>Student Login</h1>
+    <div class="card auth-card">
+        <div class="eyebrow">Candidate Access</div>
+        <h1>Student Login</h1>
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, message in messages %}
-          <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">{{ message }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
 
-    <form method="POST" style="margin-top: 20px;">
-      <div class="form-group">
-        <label for="student_id">Student ID</label>
-        <input type="text" id="student_id" name="student_id" required>
-      </div>
-      <div class="form-group">
-        <label for="password">Password</label>
-        <input type="password" id="password" name="password" required>
-      </div>
-      <button type="submit" class="btn btn-primary btn-block">Login</button>
-    </form>
+        <form method="POST" style="margin-top: 20px;">
+            <div class="form-group">
+                <label for="student_id">Student ID</label>
+                <input type="text" id="student_id" name="student_id" required>
+            </div>
 
-    <div class="switch">
-      Don't have an account? <a href="{{ url_for('student_register') }}">Register here</a>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-block">
+                Login
+            </button>
+        </form>
+
+        <div class="switch">
+            Don't have an account?
+            <a href="{{ url_for('student_register') }}">Register here</a>
+        </div>
     </div>
-  </div>
 </div>
+
+<script>
+(function () {
+    const ua = navigator.userAgent || "";
+
+    const isMobileUA =
+        /Android|iPhone|iPad|iPod|Mobile|Windows Phone|Opera Mini/i.test(ua);
+
+    const isTouchMac =
+        navigator.platform === "MacIntel" &&
+        navigator.maxTouchPoints > 1;
+
+    const isSmallTouchDevice =
+        navigator.maxTouchPoints > 1 &&
+        Math.min(screen.width, screen.height) < 600;
+
+    if (isMobileUA || isTouchMac || isSmallTouchDevice) {
+        document.documentElement.innerHTML = `
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Device Not Supported</title>
+            </head>
+            <body style="font-family:Arial,sans-serif;text-align:center;padding:40px 20px">
+                <h2>Device Not Supported</h2>
+                <p>This examination can only be accessed on a laptop or desktop computer.</p>
+                <p>Please use a supported computer to continue.</p>
+            </body>
+        `;
+    }
+})();
+</script>
 
 </body>
 </html>
+```

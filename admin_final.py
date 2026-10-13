@@ -92,6 +92,33 @@ app = Flask(__name__)
 
 app.secret_key = "admin_teacher_management_system_secret_key"
 
+@app.after_request
+def examguard_admin_ui_cleanup(response):
+    try:
+        if (request.method == "GET" and response.status_code == 200
+                and "text/html" in response.content_type and not response.is_streamed):
+            path = (request.path or "").rstrip("/")
+            body = response.get_data(as_text=True)
+            if path in ("/admin/login", "/login", "/admin/register", "/register"):
+                script = r"""<script>
+(function(){function clean(){const w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if((n.nodeValue||'').trim().toLowerCase()==='html')n.nodeValue='';}}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',clean);else clean();})();
+</script>"""
+                if "</body>" in body and "examguard-admin-clean-html" not in body:
+                    body = body.replace("</body>", "<!--examguard-admin-clean-html-->" + script + "</body>")
+            if path in ("/admin/dashboard", "/dashboard"):
+                script = r"""<script>
+(function(){document.querySelectorAll('a,button').forEach(el=>{if((el.textContent||'').trim().toLowerCase()==='home')el.remove();});})();
+</script>"""
+                if "</body>" in body and "examguard-admin-dashboard-home-cleanup" not in body:
+                    body = body.replace("</body>", "<!--examguard-admin-dashboard-home-cleanup-->" + script + "</body>")
+            if body != response.get_data(as_text=True):
+                response.set_data(body)
+                response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("[UI] Admin cleanup skipped:", exc)
+    return response
+
+
 # Anchor every shared path to THIS FILE's own folder — must match
 # the same fix in student_app.py exactly, since both apps need to
 # agree on the physical location of these folders/file.
@@ -117,6 +144,71 @@ os.makedirs(RECORDING_PARTS_FOLDER, exist_ok=True)
 # it to BASE_DIR like every other shared folder so it always resolves
 # to the same place regardless of how/where the app is started.
 DOWNLOADS_FOLDER = os.path.join(BASE_DIR, "downloads")
+
+# Cloudinary storage for durable recordings on Render's ephemeral filesystem.
+def _cloudinary_configured():
+    return all(os.environ.get(k, '').strip() for k in ('CLOUDINARY_CLOUD_NAME','CLOUDINARY_API_KEY','CLOUDINARY_API_SECRET'))
+
+def _cloudinary_public_id(filename):
+    safe = os.path.basename(str(filename or 'recording.webm'))
+    stem = os.path.splitext(safe)[0]
+    stem = re.sub(r'[^A-Za-z0-9_-]+', '_', stem)[:180] or 'recording'
+    return 'examguard/recordings/' + stem
+
+def _cloudinary_recording_url(filename):
+    """Return a URL only when Cloudinary confirms the exact video exists.
+
+    Never construct a plausible URL from a filename: that made missing uploads
+    appear playable in the admin UI. The public ID includes the stable
+    student+exam filename, so each result row resolves only its own recording.
+    """
+    if not filename or not _cloudinary_configured():
+        return ''
+    try:
+        import cloudinary
+        import cloudinary.api
+        cloudinary.config(
+            cloud_name=os.environ['CLOUDINARY_CLOUD_NAME'].strip(),
+            api_key=os.environ['CLOUDINARY_API_KEY'].strip(),
+            api_secret=os.environ['CLOUDINARY_API_SECRET'].strip(),
+            secure=True,
+        )
+        resource = cloudinary.api.resource(
+            _cloudinary_public_id(filename), resource_type='video',
+        )
+        url = str(resource.get('secure_url') or '').strip()
+        return url if url.startswith('https://') else ''
+    except Exception as exc:
+        # 404 / credentials / network errors all mean: do not show a fake link.
+        print('[CLOUDINARY] Recording existence check failed:', os.path.basename(str(filename)), exc)
+        return ''
+
+def _upload_recording_to_cloudinary(filepath, filename):
+    if not _cloudinary_configured():
+        print('[CLOUDINARY] Credentials missing; durable upload skipped')
+        return False, ''
+    try:
+        import cloudinary
+        import cloudinary.uploader
+        cloudinary.config(
+            cloud_name=os.environ['CLOUDINARY_CLOUD_NAME'].strip(),
+            api_key=os.environ['CLOUDINARY_API_KEY'].strip(),
+            api_secret=os.environ['CLOUDINARY_API_SECRET'].strip(),
+            secure=True,
+        )
+        result = cloudinary.uploader.upload_large(
+            filepath, resource_type='video', public_id=_cloudinary_public_id(filename),
+            overwrite=True, chunk_size=6 * 1024 * 1024,
+        )
+        url = str(result.get('secure_url') or '')
+        if not url:
+            return False, ''
+        print('[CLOUDINARY] Recording stored:', os.path.basename(filename))
+        return True, url
+    except Exception as exc:
+        print('[CLOUDINARY] Recording upload failed:', exc)
+        return False, ''
+
 
 # STUDENT -> ADMIN RESULT / RECORDING SYNC
 RECORDING_SYNC_TOKEN = os.environ.get("EXAMGUARD_RECORDING_SYNC_TOKEN", "EXAMGUARD-RECORDING-2026-LOCAL").strip()
@@ -887,7 +979,6 @@ def index():
             <h2 style="font-size:18px;margin:0 0 8px;color:#f1f0f7;">Admin</h2>
             <p style="color:#b7b3cc;font-size:13.5px;margin-bottom:18px;">Monitor exams live and review recordings.</p>
             <a href="/admin/login" style="margin-right:14px;color:#9d85ff;font-weight:600;">Login</a>
-            <a href="/admin/register" style="color:#9d85ff;font-weight:600;">Register</a>
           </div>
         </div>
       </div>
@@ -1786,13 +1877,51 @@ def internal_sync_recording():
     try:
         exam_id=str(request.form.get("exam_id","")).strip(); student_id=str(request.form.get("student_id","")).strip(); up=request.files.get("recording"); fn=_safe_sync_filename(request.form.get("filename",""))
         if not exam_id or not student_id or not up: return jsonify({"success":False,"error":"Missing recording data"}),400
-        os.makedirs(RECORDINGS_FOLDER,exist_ok=True); target=os.path.join(RECORDINGS_FOLDER,fn); temp=target+".uploading"; up.save(temp)
+        os.makedirs(RECORDINGS_FOLDER,exist_ok=True); target=os.path.join(RECORDINGS_FOLDER,fn); temp=target+f".{uuid.uuid4().hex[:8]}.uploading"; up.save(temp)
         with open(temp,"rb") as fh: magic=fh.read(4)
         if os.path.getsize(temp)<1024 or magic!=bytes((0x1a,0x45,0xdf,0xa3)):
             os.remove(temp); temp=None; return jsonify({"success":False,"error":"Invalid WebM recording"}),400
         os.replace(temp,target); temp=None
-        print(f"[SYNC] Recording received: {fn} ({student_id}/{exam_id})")
-        return jsonify({"success":True,"filename":fn,"size":os.path.getsize(target)})
+        cloud_ok, cloud_url = _upload_recording_to_cloudinary(target, fn)
+        if _cloudinary_configured() and not cloud_ok:
+            return jsonify({"success":False,"error":"Recording saved locally but Cloudinary upload failed; retry required"}),503
+
+        # If the result arrived before the recording, attach the confirmed
+        # filename now so the admin recordings/results screens do not retain
+        # an empty or stale Recording File value.
+        wb = None
+        try:
+            if os.path.isfile(DATABASE) and _valid_xlsx(DATABASE):
+                wb = load_database()
+                if "Results" in wb.sheetnames:
+                    ws = wb["Results"]
+                    headers = [cell.value for cell in ws[1]]
+                    if "Recording File" not in headers:
+                        ws.cell(row=1, column=ws.max_column + 1, value="Recording File")
+                        headers = [cell.value for cell in ws[1]]
+                    if "Student ID" in headers and "Exam ID" in headers:
+                        sid_col = headers.index("Student ID") + 1
+                        exam_col = headers.index("Exam ID") + 1
+                        file_col = headers.index("Recording File") + 1
+                        matched = False
+                        for row_num in range(2, ws.max_row + 1):
+                            if (str(ws.cell(row_num, sid_col).value or "") == student_id
+                                    and str(ws.cell(row_num, exam_col).value or "") == exam_id):
+                                ws.cell(row_num, file_col, fn)
+                                matched = True
+                        if matched:
+                            save_database(wb)
+                if wb is not None:
+                    wb.close()
+                    wb = None
+        except Exception as db_exc:
+            print("[SYNC] Recording saved but result-link update failed:", db_exc)
+            try:
+                if wb is not None: wb.close()
+            except Exception: pass
+
+        print(f"[SYNC] Recording received and linked: {fn} ({student_id}/{exam_id})")
+        return jsonify({"success":True,"filename":fn,"size":os.path.getsize(target),"durable":bool(cloud_url),"recording_url":cloud_url})
     except Exception as e:
         if temp:
             try: os.remove(temp)
@@ -1804,7 +1933,32 @@ def internal_sync_result():
     if not _sync_token_valid(request.headers.get("X-ExamGuard-Sync-Token","")): return jsonify({"success":False,"error":"Unauthorized result sync"}),401
     wb=None
     try:
-        payload=request.get_json(silent=True) or {}; wb=load_database(); _upsert_admin_sync_result(wb,payload); save_database(wb); wb.close(); return jsonify({"success":True,"result_id":payload.get("result_id","")})
+        payload=request.get_json(silent=True) or {}
+        wb=load_database()
+        _upsert_admin_sync_result(wb,payload)
+        # If the video arrived first, attach it while inserting/upserting the result.
+        recording_name = str(payload.get("recording_file", "") or "").strip()
+        if not recording_name:
+            sid_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(payload.get("student_id", "")))[:100] or "student"
+            exam_safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(payload.get("exam_id", "")))[:100] or "exam"
+            candidate = _safe_sync_filename(f"{sid_safe}_{exam_safe}.webm")
+            if os.path.isfile(os.path.join(RECORDINGS_FOLDER, candidate)):
+                recording_name = candidate
+        if recording_name and "Results" in wb.sheetnames:
+            ws = wb["Results"]
+            headers = [cell.value for cell in ws[1]]
+            if "Recording File" not in headers:
+                ws.cell(row=1, column=ws.max_column + 1, value="Recording File")
+                headers = [cell.value for cell in ws[1]]
+            rid_col = headers.index("Result ID") + 1
+            file_col = headers.index("Recording File") + 1
+            for row_num in range(2, ws.max_row + 1):
+                if str(ws.cell(row_num, rid_col).value or "") == str(payload.get("result_id", "")):
+                    ws.cell(row_num, file_col, recording_name)
+                    break
+        save_database(wb)
+        wb.close()
+        return jsonify({"success":True,"result_id":payload.get("result_id","")})
     except Exception as e:
         try: wb.close()
         except Exception: pass
@@ -1930,12 +2084,17 @@ def internal_sync_recording_finalize():
         else:
             try: os.remove(partial)
             except OSError: pass
+        cloud_ok, cloud_url = _upload_recording_to_cloudinary(target, filename)
+        if _cloudinary_configured() and not cloud_ok:
+            # Keep local validated copy and report failure so student does not unlock
+            # while durable cloud storage has not confirmed receipt. A retry can finalize again.
+            return jsonify({"success": False, "error": "Recording assembled but Cloudinary upload failed; retry finalize", "retry": True}), 503
         try:
             if os.path.isfile(progressive): os.remove(progressive)
         except OSError: pass
         shutil.rmtree(token_dir, ignore_errors=True)
-        print(f"[SYNC] Recording finalized on admin: {filename} ({student_id}/{exam_id})")
-        return jsonify({"success": True, "filename": filename, "size": os.path.getsize(target)})
+        print(f"[SYNC] Recording finalized on admin: {filename} ({student_id}/{exam_id}); cloudinary={bool(cloud_url)}")
+        return jsonify({"success": True, "filename": filename, "size": os.path.getsize(target), "durable": bool(cloud_url), "recording_url": cloud_url})
     except Exception as e:
         print("[SYNC] recording finalize error:", e)
         try:
@@ -2157,7 +2316,7 @@ def teacher_exam_results(exam_id):
         unattempted = int(result_value(row, "Unattempted Answers", max(0, total - correct - wrong)) or 0)
         recording_file = str(result_value(row, "Recording File", "") or "").strip()
         safe_recording = os.path.basename(recording_file)
-        recording_available = bool(safe_recording and os.path.isfile(os.path.join(RECORDINGS_FOLDER, safe_recording)))
+        recording_available = bool(safe_recording and (os.path.isfile(os.path.join(RECORDINGS_FOLDER, safe_recording)) or _cloudinary_recording_url(safe_recording)))
 
         student_results.append({
             "result_id": result_value(row, "Result ID", ""),
@@ -2172,8 +2331,8 @@ def teacher_exam_results(exam_id):
             "exam_status": result_value(row, "Exam Status", "Completed") or "Completed",
             "recording_file": safe_recording,
             "recording_available": recording_available,
-            "recording_url": url_for("admin_stream_recording", filename=safe_recording) if recording_available else "",
-            "recording_download_url": url_for("admin_download_recording", filename=safe_recording) if recording_available else "",
+            "recording_url": (url_for("admin_stream_recording", filename=safe_recording) if os.path.isfile(os.path.join(RECORDINGS_FOLDER, safe_recording)) else _cloudinary_recording_url(safe_recording)) if recording_available else "",
+            "recording_download_url": (url_for("admin_download_recording", filename=safe_recording) if os.path.isfile(os.path.join(RECORDINGS_FOLDER, safe_recording)) else _cloudinary_recording_url(safe_recording)) if recording_available else "",
         })
 
 
@@ -2817,7 +2976,7 @@ def admin_subject_results(subject_code):
         wrong = int(result_value(row, "Wrong Answers", 0) or 0)
         unattempted = int(result_value(row, "Unattempted Answers", max(0, total - correct - wrong)) or 0)
         recording_file = os.path.basename(str(result_value(row, "Recording File", "") or "").strip())
-        available = bool(recording_file and os.path.isfile(os.path.join(RECORDINGS_FOLDER, recording_file)))
+        available = bool(recording_file and (os.path.isfile(os.path.join(RECORDINGS_FOLDER, recording_file)) or _cloudinary_recording_url(recording_file)))
 
         student_results.append({
             "result_id": result_value(row, "Result ID", ""),
@@ -2835,7 +2994,7 @@ def admin_subject_results(subject_code):
             "exam_status": result_value(row, "Exam Status", "Completed") or "Completed",
             "recording_file": recording_file,
             "recording_available": available,
-            "recording_url": url_for("admin_stream_recording", filename=recording_file) if available else "",
+            "recording_url": (url_for("admin_stream_recording", filename=recording_file) if os.path.isfile(os.path.join(RECORDINGS_FOLDER, recording_file)) else _cloudinary_recording_url(recording_file)) if available else "",
             "recording_download_url": url_for("admin_download_recording", filename=recording_file) if available else "",
         })
 
@@ -3030,76 +3189,9 @@ def admin_login():
 
 @app.route("/admin/register", methods=["GET", "POST"])
 def admin_register():
-
-    if request.method == "POST":
-
-        admin_id = request.form["admin_id"].strip()
-
-        admin_name = request.form["admin_name"].strip()
-
-        email = request.form["email"].strip()
-
-        password = request.form["password"]
-
-
-        workbook = load_database()
-
-        sheet = workbook["Admins"]
-
-
-        # Check duplicate Admin ID
-
-        for row in sheet.iter_rows(
-            min_row=2,
-            values_only=True
-        ):
-
-            if str(row[0]) == admin_id:
-
-                workbook.close()
-
-                flash(
-                    "Admin ID already exists.",
-                    "error"
-                )
-
-                return redirect(
-                    url_for("admin_register")
-                )
-
-
-        # Save admin
-
-        sheet.append([
-            admin_id,
-            admin_name,
-            email,
-            password
-        ])
-
-
-        save_database(workbook)
-
-        workbook.close()
-
-
-        flash(
-            "Admin registration successful.",
-            "success"
-        )
-
-
-        return redirect(
-            url_for("admin_login")
-        )
-
-
-    return render_template(
-        "admin_register.html"
-    )
-
-
-
+    # Admin account creation is disabled; retain only the existing admin login.
+    flash("Admin registration is disabled.", "error")
+    return redirect(url_for("admin_login"))
 
 @app.route("/admin/logout")
 def admin_logout():
@@ -3149,7 +3241,7 @@ def admin_exam_recordings(exam_id):
             ei = hi.get("Exam ID")
             if ei is not None:
                 for row in ws.iter_rows(min_row=2, values_only=True):
-                    if ei >= len(row) or row[ei] != exam_id:
+                    if ei >= len(row) or str(row[ei] or "").strip() != str(exam_id).strip():
                         continue
 
                     def cell(col_name, default=""):
@@ -3169,8 +3261,9 @@ def admin_exam_recordings(exam_id):
                         "submitted_at": cell("Submitted At", ""),
                         "percentage": cell("Percentage", ""),
                         "exam_status": cell("Exam Status", ""),
-                        "filename": recording_name if (recording_name and os.path.isfile(recording_path)) else "",
-                        "recording_missing": bool(recording_name) and not os.path.isfile(recording_path),
+                        "filename": recording_name if (recording_name and (os.path.isfile(recording_path) or _cloudinary_recording_url(recording_name))) else "",
+                        "recording_url": _cloudinary_recording_url(recording_name) if (recording_name and not os.path.isfile(recording_path)) else "",
+                        "recording_missing": bool(recording_name) and not (os.path.isfile(recording_path) or _cloudinary_recording_url(recording_name)),
                     })
         wb.close()
     except Exception as e:
@@ -3286,7 +3379,8 @@ def admin_download_recording(filename):
     )
 
     if not os.path.isfile(filepath):
-        return "Recording not found", 404
+        cloud_url = _cloudinary_recording_url(safe_name)
+        return redirect(cloud_url) if cloud_url else ("Recording not found", 404)
 
     return send_from_directory(
         RECORDINGS_FOLDER,
@@ -3313,7 +3407,8 @@ def admin_stream_recording(filename):
     )
 
     if not os.path.isfile(filepath):
-        return "Recording not found", 404
+        cloud_url = _cloudinary_recording_url(safe_name)
+        return redirect(cloud_url) if cloud_url else ("Recording not found", 404)
 
     return send_from_directory(
         RECORDINGS_FOLDER,
@@ -3433,7 +3528,7 @@ def admin_live():
           videoOfferBusy.add(id);
           try{
             if(old){try{old.close();}catch(e){} videoPeerConnections.delete(id);}
-            const pc=new RTCPeerConnection({iceServers:[]});
+            const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});
             videoPeerConnections.set(id,pc);
             pc.addTransceiver('video',{direction:'recvonly'});
              pc.addTransceiver('audio',{direction:'recvonly'});

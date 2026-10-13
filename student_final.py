@@ -103,6 +103,26 @@ import socket
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATABASE = os.path.join(BASE_DIR, "database.xlsx")
+
+
+# Shared Neon exam reads. When DATABASE_URL is configured (Render), exam
+# listings/questions come from the same PostgreSQL table used by Admin.
+# Local development without DATABASE_URL continues to use database.xlsx.
+def _get_shared_exam_rows():
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        return None
+    import psycopg
+    conn = psycopg.connect(database_url, connect_timeout=10)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM public.exams ORDER BY exam_id, question_number")
+            rows = cur.fetchall()
+        return [tuple(value for value in row) for row in rows]
+    finally:
+        conn.close()
+
+
 RECORDINGS_FOLDER = os.path.join(BASE_DIR, "recordings")
 LIVE_FRAMES_FOLDER = os.path.join(BASE_DIR, "live_frames")
 
@@ -1921,13 +1941,17 @@ def student_login():
 @student_login_required
 def student_dashboard():
 
-    workbook = load_database()
-
-    sheet = workbook["Exams"]
+    shared_rows = _get_shared_exam_rows()
+    workbook = None
+    if shared_rows is None:
+        workbook = load_database()
+        exam_rows = list(workbook["Exams"].iter_rows(min_row=2, values_only=True))
+    else:
+        exam_rows = shared_rows
 
     subjects = {}
 
-    for row in sheet.iter_rows(min_row=2, values_only=True):
+    for row in exam_rows:
 
         exam_id = row[0]
         subject_name = row[3]
@@ -1943,7 +1967,8 @@ def student_dashboard():
                 "teacher_name": teacher_name
             }
 
-    workbook.close()
+    if workbook is not None:
+        workbook.close()
 
     subject_list = list(subjects.values())
 
@@ -3734,9 +3759,13 @@ def start_exam(exam_id):
 
     results_workbook.close()
 
-    workbook = load_database()
-
-    sheet = workbook["Exams"]
+    shared_rows = _get_shared_exam_rows()
+    workbook = None
+    if shared_rows is None:
+        workbook = load_database()
+        exam_rows = list(workbook["Exams"].iter_rows(min_row=2, values_only=True))
+    else:
+        exam_rows = shared_rows
 
     questions = []
 
@@ -3748,12 +3777,9 @@ def start_exam(exam_id):
     duration_minutes = 30
 
 
-    for row in sheet.iter_rows(
-        min_row=2,
-        values_only=True
-    ):
+    for row in exam_rows:
 
-        if row[0] == exam_id:
+        if str(row[0]) == str(exam_id):
 
             subject_name = row[3]
 
@@ -3792,7 +3818,8 @@ def start_exam(exam_id):
             })
 
 
-    workbook.close()
+    if workbook is not None:
+        workbook.close()
 
 
     if not questions:

@@ -16,6 +16,61 @@ import hmac
 import requests
 from datetime import datetime
 
+
+# Shared Neon PostgreSQL exam store. Excel remains the local/reporting copy for now.
+# Both Render services use the same DATABASE_URL.
+def _shared_db_connection():
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        return None
+    import psycopg
+    return psycopg.connect(database_url, connect_timeout=10)
+
+
+def _shared_exam_rows_from_excel(rows):
+    """Mirror this exam's question rows into Neon using the table's real column order."""
+    conn = _shared_db_connection()
+    if conn is None:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'exams'
+                    ORDER BY ordinal_position
+                """)
+                columns = [r[0] for r in cur.fetchall()]
+                if len(columns) != 15:
+                    raise RuntimeError(
+                        f"Expected 15 columns in public.exams, found {len(columns)}"
+                    )
+                cur.execute("DELETE FROM public.exams WHERE exam_id = %s", (str(rows[0][0]) if rows else "",))
+                if rows:
+                    placeholders = ", ".join(["%s"] * len(columns))
+                    column_sql = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
+                    cur.executemany(
+                        f"INSERT INTO public.exams ({column_sql}) VALUES ({placeholders})",
+                        [tuple("" if value is None else str(value) for value in row[:15]) for row in rows]
+                    )
+        return True
+    finally:
+        conn.close()
+
+
+def _shared_delete_exam(exam_id):
+    conn = _shared_db_connection()
+    if conn is None:
+        return False
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM public.exams WHERE exam_id = %s", (str(exam_id),))
+        return True
+    finally:
+        conn.close()
+
+
 # ============================================================
 # REMOTE ADMIN -> STUDENT LIVE VOICE BROADCAST
 # ============================================================
@@ -1221,8 +1276,24 @@ def create_exam():
             ])
 
         save_database(workbook)
-
         workbook.close()
+
+        if os.environ.get("DATABASE_URL", "").strip():
+            try:
+                _shared_exam_rows_from_excel([
+                    [exam_id, teacher_id, teacher_name, subject_name, subject_code,
+                     number, q["question"], q["option_a"], q["option_b"], q["option_c"],
+                     q["option_d"], q["correct_answer"], available_from, available_until,
+                     duration_minutes]
+                    for number, q in enumerate(questions, start=1)
+                ])
+            except Exception as sync_error:
+                app.logger.exception("Neon exam sync failed")
+                flash(
+                    f"Exam saved in the local workbook, but shared database sync failed: {sync_error}",
+                    "error"
+                )
+                return redirect(url_for("dashboard"))
 
         flash(
             f"Exam created successfully. Exam ID: {exam_id}",
@@ -1327,6 +1398,13 @@ def delete_exam(exam_id):
 
     save_database(workbook)
     workbook.close()
+    if os.environ.get("DATABASE_URL", "").strip():
+        try:
+            _shared_delete_exam(exam_id)
+        except Exception:
+            app.logger.exception("Neon exam delete sync failed")
+            flash("Exam was removed from the local workbook, but shared database sync failed.", "error")
+            return redirect(url_for("manage_exams"))
     flash(f"Exam {exam_id} removed successfully.", "success")
     return redirect(url_for("manage_exams"))
 
@@ -1414,6 +1492,18 @@ def edit_exam(exam_id):
 
         save_database(workbook)
         workbook.close()
+        if os.environ.get("DATABASE_URL", "").strip():
+            try:
+                _shared_exam_rows_from_excel([
+                    [exam_id, teacher_id, teacher_name, subject_name, subject_code,
+                     number, q, oa, ob, oc, od, correct, available_from,
+                     available_until, duration_minutes]
+                    for number, (q, oa, ob, oc, od, correct) in enumerate(questions, start=1)
+                ])
+            except Exception:
+                app.logger.exception("Neon exam edit sync failed")
+                flash("Exam updated in the local workbook, but shared database sync failed.", "error")
+                return redirect(url_for("dashboard"))
         flash(f"Exam {exam_id} updated successfully.", "success")
         return redirect(url_for("dashboard"))
 

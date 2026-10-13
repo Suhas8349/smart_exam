@@ -2,11 +2,27 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Student Dashboard</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<style>
+  html { zoom: 1; }
+  body { margin: 0; }
+  .exam-status { display:block; margin-bottom:7px; font-size:11px; font-weight:800; letter-spacing:.08em; }
+  .status-live { color:#16a34a; }
+  .status-finished { color:#dc2626; }
+  .countdown { display:inline-block; margin:0 8px 0 0; font:600 12px/1.4 ui-monospace,monospace; color:var(--text, #e5e7eb); white-space:nowrap; }
+  .btn-start { background:#16a34a !important; color:#fff !important; border-color:#16a34a !important; }
+  .btn-finished { background:#dc2626 !important; color:#fff !important; border-color:#dc2626 !important; cursor:default; pointer-events:none; }
+  .btn-disabled { opacity:.5; cursor:not-allowed; pointer-events:none; }
+  .exam-action { min-width:245px; white-space:nowrap; }
+  .table-card { overflow-x:auto; }
+  table { width:100%; table-layout:fixed; }
+  th, td { overflow-wrap:anywhere; }
+  @media (max-width:800px) { .exam-action { min-width:200px; } }
+</style>
 </head>
 <body>
-
 <div class="navbar">
   <div class="brand"><span class="dot"></span> ExamGuard</div>
   <div class="nav-links">
@@ -14,9 +30,7 @@
     <a href="{{ url_for('student_logout') }}" class="logout">Logout</a>
   </div>
 </div>
-
 <div class="page wide">
-
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
       {% for category, message in messages %}
@@ -24,40 +38,86 @@
       {% endfor %}
     {% endif %}
   {% endwith %}
-
   <div class="page-header">
     <div class="eyebrow">Candidate Dashboard</div>
     <h1>Available Exams</h1>
     <p class="desc">Select a subject below to begin your examination. Your camera and microphone will be monitored throughout.</p>
   </div>
-
   {% if subjects %}
   <div class="table-card">
     <table>
-      <tr>
-        <th>Subject</th>
-        <th>Instructor</th>
-        <th>Exam ID</th>
-        <th></th>
-      </tr>
+      <thead><tr><th>Subject</th><th>Instructor</th><th>Exam ID</th><th>Exam status / action</th></tr></thead>
+      <tbody>
       {% for s in subjects %}
       <tr>
         <td>{{ s.subject_name }} <span style="color: var(--text-dim);">({{ s.subject_code }})</span></td>
         <td>{{ s.teacher_name }}</td>
         <td><span class="code-tag">{{ s.exam_id }}</span></td>
-        <td><a href="{{ url_for('start_exam', exam_id=s.exam_id) }}" class="btn btn-primary btn-sm">Start Exam</a></td>
+        <td class="exam-action">
+          {% if s.finished %}
+            <span class="btn btn-sm btn-finished">Finished</span>
+          {% elif s.expired %}
+            <span class="btn btn-sm btn-finished">Closed</span>
+          {% elif s.countdown_target %}
+            <span class="countdown" data-target="{{ s.countdown_target }}">00:00:00:00</span>
+            <a href="{{ url_for('start_exam', exam_id=s.exam_id) }}" class="btn btn-primary btn-sm btn-start btn-disabled countdown-start" aria-disabled="true">Start Exam</a>
+            <small style="display:block;margin-top:5px;color:var(--text-muted);">Opens {{ s.opens_at_label }}</small>
+          {% else %}
+            <span class="exam-status status-live">LIVE</span>
+            <a href="{{ url_for('start_exam', exam_id=s.exam_id) }}" class="btn btn-primary btn-sm btn-start">Start Exam</a>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
+      </tbody>
     </table>
   </div>
   {% else %}
-  <div class="card empty-state">
-    <div class="icon">📭</div>
-    <p>No exams are available right now. Check back later.</p>
-  </div>
+  <div class="card empty-state"><div class="icon">📭</div><p>No exams are available right now. Check back later.</p></div>
   {% endif %}
-
 </div>
-
+<script>
+(function () {
+  function updateCountdowns() {
+    const now = Date.now();
+    document.querySelectorAll('.countdown[data-target]').forEach(function (timer) {
+      // Treat stored naive datetimes as the server's local timezone, matching Flask.
+      const target = new Date(timer.dataset.target).getTime();
+      const remaining = Math.max(0, target - now);
+      const totalSeconds = Math.floor(remaining / 1000);
+      const days = Math.floor(totalSeconds / 86400);
+      const hours = Math.floor((totalSeconds % 86400) / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+      timer.textContent = [days, hours, minutes, seconds].map(function (n) {
+        return String(n).padStart(2, '0');
+      }).join(':');
+      const button = timer.parentElement.querySelector('.countdown-start');
+      if (remaining <= 0 && button) {
+        button.classList.remove('btn-disabled');
+        button.removeAttribute('aria-disabled');
+        timer.remove();
+        const live = document.createElement('span');
+        live.className = 'exam-status status-live';
+        live.textContent = 'LIVE';
+        timer.parentElement.insertBefore(live, button);
+      }
+    });
+  }
+  updateCountdowns();
+  setInterval(updateCountdowns, 1000);
+  // Refresh server-side attempt status and exam changes periodically.
+  setInterval(function () {
+    if (document.visibilityState === 'visible') window.location.reload();
+  }, 30000);
+  // Avoid accidental keyboard zoom; kiosk Edge still controls browser-level zoom.
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '0'].includes(e.key)) e.preventDefault();
+  });
+  document.addEventListener('wheel', function (e) {
+    if (e.ctrlKey) e.preventDefault();
+  }, {passive:false});
+})();
+</script>
 </body>
 </html>

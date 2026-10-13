@@ -1940,7 +1940,7 @@ def student_login():
 @app.route("/student/dashboard")
 @student_login_required
 def student_dashboard():
-
+    # Read the same exam rows used by the shared Neon setup on Render.
     shared_rows = _get_shared_exam_rows()
     workbook = None
     if shared_rows is None:
@@ -1949,33 +1949,75 @@ def student_dashboard():
     else:
         exam_rows = shared_rows
 
+    now = datetime.now()
     subjects = {}
-
     for row in exam_rows:
+        if not row or row[0] in (None, ""):
+            continue
+        exam_id = str(row[0])
+        if exam_id in subjects:
+            continue
 
-        exam_id = row[0]
-        subject_name = row[3]
-        subject_code = row[4]
-        teacher_name = row[2]
+        from_raw = row[12] if len(row) > 12 else ""
+        until_raw = row[13] if len(row) > 13 else ""
+        opens_at = _dashboard_parse_datetime(from_raw)
+        closes_at = _dashboard_parse_datetime(until_raw)
 
-        if exam_id not in subjects:
+        # A result row for this student + exam means this attempt is consumed,
+        # whether completed normally or terminated for a policy violation.
+        finished = False
+        try:
+            results_wb = load_database()
+            if "Results" in results_wb.sheetnames:
+                result_sheet = results_wb["Results"]
+                headers = [str(c.value or "").strip().lower() for c in result_sheet[1]]
+                student_col = headers.index("student id") if "student id" in headers else 1
+                exam_col = headers.index("exam id") if "exam id" in headers else 3
+                for result_row in result_sheet.iter_rows(min_row=2, values_only=True):
+                    if (len(result_row) > max(student_col, exam_col)
+                        and str(result_row[student_col]) == str(session.get("student_id", ""))
+                        and str(result_row[exam_col]) == exam_id):
+                        finished = True
+                        break
+            results_wb.close()
+        except Exception as exc:
+            print("[DASHBOARD] Could not check previous attempts:", exc)
 
-            subjects[exam_id] = {
-                "exam_id": exam_id,
-                "subject_name": subject_name,
-                "subject_code": subject_code,
-                "teacher_name": teacher_name
-            }
+        is_future = bool(opens_at and now < opens_at)
+        is_expired = bool(closes_at and now > closes_at)
+        can_start = not finished and not is_future and not is_expired
+        live = can_start
+        subjects[exam_id] = {
+            "exam_id": exam_id,
+            "subject_name": row[3] if len(row) > 3 else "",
+            "subject_code": row[4] if len(row) > 4 else "",
+            "teacher_name": row[2] if len(row) > 2 else "",
+            "finished": finished,
+            "can_start": can_start,
+            "live": live,
+            "countdown_target": opens_at.isoformat() if opens_at and is_future and not finished else "",
+            "opens_at_label": opens_at.strftime("%d %b %Y, %I:%M:%S %p") if opens_at else "",
+            "expired": is_expired,
+        }
 
     if workbook is not None:
         workbook.close()
 
-    subject_list = list(subjects.values())
+    return render_template("student_dashboard.html", subjects=list(subjects.values()))
 
-    return render_template(
-        "student_dashboard.html",
-        subjects=subject_list
-    )
+
+def _dashboard_parse_datetime(raw_value):
+    if isinstance(raw_value, datetime):
+        return raw_value
+    if not raw_value:
+        return None
+    raw = str(raw_value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            pass
+    return None
 
 
 # ============================================================

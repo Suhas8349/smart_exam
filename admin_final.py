@@ -1122,43 +1122,66 @@ def login():
 @app.route("/dashboard")
 @teacher_login_required
 def dashboard():
-
     teacher_id = session["teacher_id"]
-
-    workbook = load_database()
-
-    sheet = workbook["Exams"]
-
     exams = {}
 
-    for row in sheet.iter_rows(min_row=2, values_only=True):
+    # On Render, use the same shared Neon database as the Student service.
+    # This prevents the dashboard from showing stale rows from database.xlsx.
+    if os.environ.get("DATABASE_URL", "").strip():
+        conn = None
+        try:
+            conn = _shared_db_connection()
+            if conn is None:
+                raise RuntimeError("DATABASE_URL is not configured")
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.exams")
+                rows = cur.fetchall()
 
-        exam_id = row[0]
-
-        if row[1] == teacher_id:
-
-            if exam_id not in exams:
-
-                exams[exam_id] = {
-                    "exam_id": exam_id,
-                    "subject_name": row[3],
-                    "subject_code": row[4],
-                    "teacher_name": row[2],
-                    "question_count": 0
-                }
-
-            exams[exam_id]["question_count"] += 1
-
-    workbook.close()
+            for row in rows:
+                if len(row) < 15:
+                    continue
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exam_id = row[0]
+                if exam_id not in exams:
+                    exams[exam_id] = {
+                        "exam_id": exam_id,
+                        "subject_name": row[3],
+                        "subject_code": row[4],
+                        "teacher_name": row[2],
+                        "question_count": 0,
+                    }
+                exams[exam_id]["question_count"] += 1
+        except Exception:
+            app.logger.exception("Failed to load teacher dashboard exams from Neon")
+            flash("Could not load exams from the shared database. Please try again.", "error")
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        # Keep Excel behavior for local development without DATABASE_URL.
+        workbook = load_database()
+        try:
+            sheet = workbook["Exams"]
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                exam_id = row[0]
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                if exam_id not in exams:
+                    exams[exam_id] = {
+                        "exam_id": exam_id,
+                        "subject_name": row[3],
+                        "subject_code": row[4],
+                        "teacher_name": row[2],
+                        "question_count": 0,
+                    }
+                exams[exam_id]["question_count"] += 1
+        finally:
+            workbook.close()
 
     exam_list = list(exams.values())
-
     exam_list.reverse()
-
-    return render_template(
-        "dashboard.html",
-        exams=exam_list
-    )
+    return render_template("dashboard.html", exams=exam_list)
 
 
 # ============================================================
@@ -1431,18 +1454,54 @@ def create_exam():
 @teacher_login_required
 def manage_exams():
     teacher_id = session["teacher_id"]
-    workbook = load_database()
-    sheet = workbook["Exams"]
     exams = {}
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        if row[1] == teacher_id:
-            exams.setdefault(row[0], {
-                "exam_id": row[0], "subject_name": row[3],
-                "subject_code": row[4], "question_count": 0,
-                "duration_minutes": row[14] if len(row) > 14 and row[14] else 30,
-            })
-            exams[row[0]]["question_count"] += 1
-    workbook.close()
+
+    # Match the Student service's shared Neon data on Render.
+    if os.environ.get("DATABASE_URL", "").strip():
+        conn = None
+        try:
+            conn = _shared_db_connection()
+            if conn is None:
+                raise RuntimeError("DATABASE_URL is not configured")
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.exams")
+                rows = cur.fetchall()
+
+            for row in rows:
+                if len(row) < 15 or str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exam_id = row[0]
+                exams.setdefault(exam_id, {
+                    "exam_id": exam_id,
+                    "subject_name": row[3],
+                    "subject_code": row[4],
+                    "question_count": 0,
+                    "duration_minutes": row[14] if row[14] else 30,
+                })
+                exams[exam_id]["question_count"] += 1
+        except Exception:
+            app.logger.exception("Failed to load managed exams from Neon")
+            flash("Could not load exams from the shared database. Please try again.", "error")
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        # Keep Excel behavior for local development without DATABASE_URL.
+        workbook = load_database()
+        try:
+            sheet = workbook["Exams"]
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exams.setdefault(row[0], {
+                    "exam_id": row[0], "subject_name": row[3],
+                    "subject_code": row[4], "question_count": 0,
+                    "duration_minutes": row[14] if len(row) > 14 and row[14] else 30,
+                })
+                exams[row[0]]["question_count"] += 1
+        finally:
+            workbook.close()
+
     return render_template("manage_exams.html", exams=list(exams.values()))
 
 

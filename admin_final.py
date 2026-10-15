@@ -3055,79 +3055,71 @@ def admin_subject_results(subject_code):
 @app.route("/admin/dashboard")
 #@admin_login_required
 def admin_dashboard():
-
-    workbook = load_database()
-
-    exam_sheet = workbook["Exams"]
-
     subjects = {}
+    conn = None
 
+    # Prefer the shared Neon exam store so Admin sees the same exams as Student.
+    if os.environ.get("DATABASE_URL", "").strip():
+        try:
+            conn = _shared_db_connection()
+            if conn is not None:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT exam_id, teacher_name, subject_name, subject_code
+                        FROM public.exams
+                        ORDER BY subject_code, subject_name, exam_id
+                    """)
+                    rows = cur.fetchall()
+                for exam_id, teacher_name, subject_name, subject_code in rows:
+                    key = subject_code or subject_name or "Unknown"
+                    if key not in subjects:
+                        subjects[key] = {
+                            "subject_code": subject_code,
+                            "subject_name": subject_name,
+                            "teacher_names": set(),
+                            "exam_ids": [],
+                        }
+                    if teacher_name:
+                        subjects[key]["teacher_names"].add(teacher_name)
+                    if exam_id and exam_id not in subjects[key]["exam_ids"]:
+                        subjects[key]["exam_ids"].append(exam_id)
+        except Exception:
+            app.logger.exception("Could not load Admin dashboard exams from Neon")
+            subjects.clear()
+        finally:
+            if conn is not None:
+                conn.close()
 
-    for row in exam_sheet.iter_rows(
-        min_row=2,
-        values_only=True
-    ):
-
-        exam_id = row[0]
-
-        teacher_id = row[1]
-
-        teacher_name = row[2]
-
-        subject_name = row[3]
-
-        subject_code = row[4]
-
-
-        key = subject_code
-
-
-        if key not in subjects:
-
-            subjects[key] = {
-
-                "subject_code": subject_code,
-
-                "subject_name": subject_name,
-
-                "teacher_names": set(),
-
-                "exam_ids": []
-
-            }
-
-
-        subjects[key]["teacher_names"].add(
-            teacher_name
-        )
-
-
-        if exam_id not in subjects[key]["exam_ids"]:
-
-            subjects[key]["exam_ids"].append(
-                exam_id
-            )
-
-
-    workbook.close()
-
-
-    # Convert set to string
+    # Fallback for local development when DATABASE_URL is not configured,
+    # or if the shared database query fails.
+    if not subjects:
+        workbook = load_database(read_only=True, data_only=True)
+        try:
+            exam_sheet = workbook["Exams"]
+            for row in exam_sheet.iter_rows(min_row=2, values_only=True):
+                exam_id = row[0]
+                teacher_name = row[2]
+                subject_name = row[3]
+                subject_code = row[4]
+                key = subject_code or subject_name or "Unknown"
+                if key not in subjects:
+                    subjects[key] = {
+                        "subject_code": subject_code,
+                        "subject_name": subject_name,
+                        "teacher_names": set(),
+                        "exam_ids": [],
+                    }
+                if teacher_name:
+                    subjects[key]["teacher_names"].add(teacher_name)
+                if exam_id and exam_id not in subjects[key]["exam_ids"]:
+                    subjects[key]["exam_ids"].append(exam_id)
+        finally:
+            workbook.close()
 
     for subject in subjects.values():
+        subject["teacher_names"] = ", ".join(sorted(subject["teacher_names"]))
 
-        subject["teacher_names"] = ", ".join(
-            subject["teacher_names"]
-        )
-
-
-    return render_template(
-
-        "admin_dashboard.html",
-
-        subjects=list(subjects.values())
-
-    )
+    return render_template("admin_dashboard.html", subjects=list(subjects.values()))
 
 
 @app.route("/admin/login", methods=["GET", "POST"])

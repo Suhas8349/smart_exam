@@ -90,66 +90,6 @@ def block_mobile_devices():
         """), 403
 app.secret_key = "student_exam_system_secret_key"
 
-
-@app.after_request
-def inject_exam_virtual_keyboard(response):
-    """Add a mouse-only password keyboard to the active student exam page."""
-    try:
-        path = request.path or ""
-        if (False and request.method == "GET" and re.fullmatch(r"/student/exam/[^/]+", path)
-                and response.status_code == 200
-                and response.mimetype == "text/html"):
-            html = response.get_data(as_text=True)
-            panel = r'''
-<style>
-#eg-vkbd{position:fixed;z-index:999999;right:16px;bottom:16px;width:min(570px,calc(100vw - 32px));padding:14px;background:#111827;color:#f9fafb;border:1px solid #475569;border-radius:14px;box-shadow:0 16px 50px #0008;font:14px Arial,sans-serif}
-#eg-vkbd h3{margin:0 0 8px;font-size:16px}#eg-vkbd p{margin:6px 0 10px;color:#cbd5e1;font-size:12px}
-#eg-vkbd-input{box-sizing:border-box;width:100%;padding:10px;border-radius:8px;border:1px solid #64748b;background:#020617;color:#fff;font-size:16px;margin-bottom:8px}
-#eg-vkbd-keys{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:5px}
-#eg-vkbd button{cursor:pointer;border:1px solid #64748b;border-radius:6px;padding:9px 3px;background:#334155;color:#fff;font-weight:600;min-height:36px}
-#eg-vkbd button:disabled{opacity:.45;cursor:not-allowed}#eg-vkbd .eg-wide{grid-column:span 2}#eg-vkbd .eg-actions{display:flex;gap:7px;margin-top:8px}#eg-vkbd .eg-actions button{flex:1}
-#eg-vkbd-status{min-height:18px;color:#fbbf24;font-size:12px;margin-top:7px}#eg-vkbd-status.eg-ok{color:#86efac}
-@media(max-width:520px){#eg-vkbd{right:8px;bottom:8px;width:calc(100vw - 16px);padding:9px}#eg-vkbd button{padding:7px 1px;min-height:32px;font-size:11px}}
-</style>
-<section id="eg-vkbd" aria-label="Exam keyboard unlock">
-  <h3>🔒 Keyboard locked</h3>
-  <p id="eg-vkbd-help">The keyboard unlock is available after this server receives your exam recording. Use the on-screen keys with your mouse.</p>
-  <input id="eg-vkbd-input" type="password" autocomplete="off" readonly aria-label="Teacher unlock password" placeholder="Enter authorized password using on-screen keys">
-  <div id="eg-vkbd-keys"></div>
-  <div class="eg-actions"><button type="button" id="eg-vkbd-back">⌫ Backspace</button><button type="button" id="eg-vkbd-clear">Clear</button><button type="button" id="eg-vkbd-unlock" disabled>Unlock keyboard</button></div>
-  <div id="eg-vkbd-status" role="status">Waiting for recording receipt…</div>
-</section>
-<script>
-(function(){
- const panel=document.getElementById('eg-vkbd'); if(!panel)return;
- const examId=decodeURIComponent(location.pathname.split('/').pop());
- const input=document.getElementById('eg-vkbd-input'), keys=document.getElementById('eg-vkbd-keys');
- const status=document.getElementById('eg-vkbd-status'), unlock=document.getElementById('eg-vkbd-unlock');
- let recordingReceived=false, unlocked=false, shifted=false;
- const rows=['1234567890','qwertyuiop','asdfghjkl','zxcvbnm'];
- function setStatus(t,ok){status.textContent=t;status.classList.toggle('eg-ok',!!ok)}
- function addKey(label,value,extra){const b=document.createElement('button');b.type='button';b.textContent=label;if(extra)b.className=extra;b.addEventListener('click',()=>{if(unlocked)return;if(value==='SHIFT'){shifted=!shifted;renderKeys();return}input.value+=shifted?value.toUpperCase():value;shifted=false;renderKeys();input.focus();});keys.appendChild(b)}
- function renderKeys(){keys.replaceChildren();rows.forEach(row=>{for(const ch of row)addKey(shifted?ch.toUpperCase():ch,ch)});addKey(shifted?'Shift ✓':'Shift','SHIFT','eg-wide');addKey('@','@');addKey('_','_');addKey('-','-');addKey('.','.');}
- renderKeys();
- document.getElementById('eg-vkbd-back').addEventListener('click',()=>{input.value=input.value.slice(0,-1)});
- document.getElementById('eg-vkbd-clear').addEventListener('click',()=>{input.value='';setStatus(recordingReceived?'Enter the authorized password.':'Waiting for recording receipt…')});
- async function checkReceipt(){try{const r=await fetch('/student/exam/recording-receipt/'+encodeURIComponent(examId),{credentials:'same-origin',cache:'no-store'});const d=await r.json();recordingReceived=!!d.received;if(recordingReceived){unlock.disabled=false;setStatus('Recording received by server. Enter the authorized password.',false)}else{unlock.disabled=true;setStatus('Waiting for recording receipt…',false)}}catch(e){unlock.disabled=true;setStatus('Cannot verify recording receipt yet.',false)}}
- unlock.addEventListener('click',async()=>{if(!recordingReceived){setStatus('Recording must be received first.',false);return}if(!input.value){setStatus('Enter the password using the on-screen keys.',false);return}unlock.disabled=true;setStatus('Checking password…',false);try{const r=await fetch('/student/exam/keyboard-unlock',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({exam_id:examId,password:input.value,source:'virtual_keyboard'})});const d=await r.json();if(d.unlocked){unlocked=true;input.value='';panel.innerHTML='<h3>🔓 Keyboard unlocked</h3><p>The authorized password was accepted.</p>';setStatus('Keyboard unlocked.',true);window.dispatchEvent(new CustomEvent('examguard:keyboard-unlocked'));}else if(d.reason==='recording_not_received'){recordingReceived=false;setStatus('Recording has not been received yet.',false)}else{input.value='';setStatus('Incorrect password. Try again.',false)}}catch(e){setStatus('Could not verify password. Try again.',false)}finally{if(!unlocked)unlock.disabled=!recordingReceived}});
- checkReceipt();setInterval(()=>{if(!unlocked)checkReceipt()},1200);
-})();
-</script>
-'''
-
-            if "</body>" in html.lower():
-                match = re.search(r"</body\s*>", html, flags=re.I)
-                if match:
-                    html = html[:match.start()] + panel + html[match.start():]
-                    response.set_data(html)
-                    response.headers["Content-Length"] = str(len(response.get_data()))
-    except Exception as exc:
-        app.logger.warning("Virtual keyboard injection skipped: %s", exc)
-    return response
-
 import socket
 
 # Anchor every shared path to THIS FILE's own folder, not the current
@@ -163,26 +103,6 @@ import socket
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATABASE = os.path.join(BASE_DIR, "database.xlsx")
-
-
-# Shared Neon exam reads. When DATABASE_URL is configured (Render), exam
-# listings/questions come from the same PostgreSQL table used by Admin.
-# Local development without DATABASE_URL continues to use database.xlsx.
-def _get_shared_exam_rows():
-    database_url = os.environ.get("DATABASE_URL", "").strip()
-    if not database_url:
-        return None
-    import psycopg
-    conn = psycopg.connect(database_url, connect_timeout=10)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM public.exams ORDER BY exam_id, question_number")
-            rows = cur.fetchall()
-        return [tuple(value for value in row) for row in rows]
-    finally:
-        conn.close()
-
-
 RECORDINGS_FOLDER = os.path.join(BASE_DIR, "recordings")
 LIVE_FRAMES_FOLDER = os.path.join(BASE_DIR, "live_frames")
 
@@ -196,42 +116,30 @@ ADMIN_SYNC_TOKEN=os.environ.get("EXAMGUARD_RECORDING_SYNC_TOKEN","EXAMGUARD-RECO
 ADMIN_SYNC_VERIFY_SSL=os.environ.get("EXAMGUARD_ADMIN_VERIFY_SSL","false").strip().lower() in ("1","true","yes","on")
 LIVE_MONITOR_BUILD="V3-DIRECT-PULL"
 LIVE_SYNC_TOKEN=os.environ.get("EXAMGUARD_LIVE_SYNC_TOKEN","EXAMGUARD-LIVE-2026-LOCAL").strip()
+
+def _student_public_signal_base_url():
+    """Return the public URL admin must use to reach this student's signaling routes.
+
+    Render sits behind a reverse proxy, so request.url_root may incorrectly
+    report http:// even when the browser uses HTTPS. An explicit environment
+    setting wins; otherwise honor forwarded headers and force HTTPS on Render.
+    """
+    configured = os.environ.get("STUDENT_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    host = str(request.host or "").strip()
+    if not host:
+        return request.url_root.rstrip("/")
+    forwarded_proto = str(request.headers.get("X-Forwarded-Proto", "")).split(",", 1)[0].strip().lower()
+    is_render = os.environ.get("RENDER", "").strip().lower() == "true" or host.lower().endswith(".onrender.com")
+    scheme = "https" if is_render else (forwarded_proto or request.scheme or "https")
+    if scheme not in ("http", "https"):
+        scheme = "https"
+    return f"{scheme}://{host}"
 ADMIN_SYNC_FOLDER=os.path.join(RECORDINGS_FOLDER,".examguard_admin_sync")
 ADMIN_RESULT_SYNC_FOLDER=os.path.join(BASE_DIR,".examguard_admin_result_sync")
 os.makedirs(ADMIN_SYNC_FOLDER,exist_ok=True)
 os.makedirs(ADMIN_RESULT_SYNC_FOLDER,exist_ok=True)
-
-RECORDING_RECEIPTS_FOLDER = os.path.join(RECORDINGS_FOLDER, ".examguard_receipts")
-os.makedirs(RECORDING_RECEIPTS_FOLDER, exist_ok=True)
-
-def _receipt_component(value):
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(value or ""))[:120] or "unknown"
-
-def _recording_receipt_path(student_id, exam_id):
-    return os.path.join(RECORDING_RECEIPTS_FOLDER, f"{_receipt_component(student_id)}__{_receipt_component(exam_id)}.json")
-
-def _write_recording_receipt(student_id, exam_id, filename, status, error=""):
-    path = _recording_receipt_path(student_id, exam_id)
-    payload = {"student_id": str(student_id), "exam_id": str(exam_id),
-               "filename": _safe_admin_filename(filename) if filename else "",
-               "status": str(status), "error": str(error)[:500],
-               "updated_at": datetime.now().isoformat(timespec="seconds")}
-    temp = path + ".tmp"
-    with open(temp, "w", encoding="utf-8") as fh: json.dump(payload, fh)
-    os.replace(temp, path)
-    return path
-
-def _admin_recording_receipt_received(student_id, exam_id):
-    try:
-        with open(_recording_receipt_path(student_id, exam_id), "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        return (payload.get("status") == "received"
-                and str(payload.get("student_id")) == str(student_id)
-                and str(payload.get("exam_id")) == str(exam_id)
-                and bool(payload.get("filename")))
-    except (OSError, ValueError, TypeError):
-        return False
-
 
 # ============================================================
 # ============================================================
@@ -291,6 +199,9 @@ class _FileLock:
 
 
 def load_database(*args, **kwargs):
+    shared = _shared_load_workbook(*args, **kwargs)
+    if shared is not None:
+        return shared
     last_error = None
     for attempt in range(10):
         try:
@@ -300,7 +211,6 @@ def load_database(*args, **kwargs):
         except (BadZipFile, EOFError, OSError) as exc:
             last_error = exc
         time.sleep(0.20 + 0.10 * attempt)
-    # One recovery attempt from the last-known-good backup.
     if _valid_xlsx(DATABASE_BACKUP):
         shutil.copy2(DATABASE_BACKUP, DATABASE)
         return load_workbook(DATABASE, *args, **kwargs)
@@ -310,28 +220,145 @@ def load_database(*args, **kwargs):
 def save_database(workbook):
     lock = _FileLock(DATABASE_LOCK)
     temp_path = None
+
     try:
         lock.acquire(30.0)
+
+        fd, temp_path = tempfile.mkstemp(
+            prefix="database_write_",
+            suffix=".xlsx",
+            dir=BASE_DIR
+        )
+        os.close(fd)
+
+        workbook.save(temp_path)
+
+        if not _valid_xlsx(temp_path):
+            raise BadZipFile(
+                "Temporary database write failed validation"
+            )
+
+        # Back up the existing local workbook.
         if _valid_xlsx(DATABASE):
             try:
                 shutil.copy2(DATABASE, DATABASE_BACKUP)
             except OSError as exc:
                 print("[DATABASE] Backup warning:", exc)
-        fd, temp_path = tempfile.mkstemp(prefix="database_write_", suffix=".xlsx", dir=BASE_DIR)
-        os.close(fd)
-        workbook.save(temp_path)
-        if not _valid_xlsx(temp_path):
-            raise BadZipFile("Temporary database write failed validation")
+
+        # Persist to Neon before updating the local cache.
+        if os.environ.get("DATABASE_URL", "").strip():
+            with open(temp_path, "rb") as source:
+                if not _shared_workbook_write(source.read()):
+                    raise RuntimeError(
+                        "Shared Neon workbook write failed"
+                    )
+
         os.replace(temp_path, DATABASE)
         temp_path = None
+
         return True
+
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
             except OSError:
                 pass
+
         lock.release()
+
+def _shared_workbook_connection():
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+    if not database_url:
+        return None
+    import psycopg
+    return psycopg.connect(database_url, connect_timeout=10)
+
+def _shared_workbook_ensure_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.examguard_workbook_store (
+                store_id INTEGER PRIMARY KEY CHECK (store_id = 1),
+                workbook_bytes BYTEA NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+def _shared_workbook_bytes():
+    conn = _shared_workbook_connection()
+    if conn is None:
+        return None
+    try:
+        with conn:
+            _shared_workbook_ensure_table(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT workbook_bytes FROM public.examguard_workbook_store WHERE store_id=1")
+                row = cur.fetchone()
+                return bytes(row[0]) if row and row[0] is not None else None
+    finally:
+        conn.close()
+
+def _shared_workbook_write(data):
+    conn = _shared_workbook_connection()
+    if conn is None:
+        return False
+    try:
+        with conn:
+            _shared_workbook_ensure_table(conn)
+            with conn.cursor() as cur:
+                # Serialize writes across Admin and Student services.
+                cur.execute("SELECT pg_advisory_xact_lock(741209, 1)")
+                cur.execute("""
+                    INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, updated_at)
+                    VALUES (1, %s, NOW())
+                    ON CONFLICT (store_id) DO UPDATE
+                    SET workbook_bytes=EXCLUDED.workbook_bytes, updated_at=NOW()
+                """, (data,))
+        return True
+    finally:
+        conn.close()
+
+def _shared_workbook_seed_if_empty():
+    """Seed Neon once from the deployed workbook, without overwriting existing shared data."""
+    if not os.environ.get("DATABASE_URL", "").strip():
+        return
+    conn = _shared_workbook_connection()
+    if conn is None:
+        return
+    try:
+        with conn:
+            _shared_workbook_ensure_table(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM public.examguard_workbook_store WHERE store_id=1")
+                if cur.fetchone():
+                    return
+                if not _valid_xlsx(DATABASE):
+                    print("[DATABASE] Shared workbook is empty and no valid local database.xlsx is available; import the workbook once.")
+                    return
+                from io import BytesIO
+                buffer = BytesIO()
+                with open(DATABASE, "rb") as source:
+                    buffer.write(source.read())
+                cur.execute("INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, updated_at) VALUES (1, %s, NOW()) ON CONFLICT (store_id) DO NOTHING", (buffer.getvalue(),))
+                print("[DATABASE] Seeded shared Neon workbook from local database.xlsx.")
+    finally:
+        conn.close()
+
+def _shared_load_workbook(*args, **kwargs):
+    data = _shared_workbook_bytes()
+    if data is None:
+        _shared_workbook_seed_if_empty()
+        data = _shared_workbook_bytes()
+    if data is None:
+        return None
+    from io import BytesIO
+    return load_workbook(BytesIO(data), *args, **kwargs)
+
+def _shared_save_workbook(workbook):
+    from io import BytesIO
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return _shared_workbook_write(buffer.getvalue())
 
 
 # =========================================================
@@ -898,7 +925,7 @@ _phone_check_counter = 0
 # frame and lowering the threshold trades a bit of CPU/more sensitivity
 # for meaningfully better catch-rate; PHONE_SCORE_THRESHOLD can be
 # tuned back up if this now over-triggers on false positives.
-PHONE_CHECK_EVERY_N_FRAMES = 1  # check every monitoring frame so debounce can reach its threshold
+PHONE_CHECK_EVERY_N_FRAMES = 3  # check every third AI frame
 PHONE_SCORE_THRESHOLD = 0.35  # balanced sensitivity to reduce false positives
 
 try:
@@ -907,27 +934,6 @@ try:
     from mediapipe.tasks.python.core.base_options import BaseOptions as _MPBaseOptions
 
     OBJECT_MODEL_PATH = str(Path(BASE_DIR, "efficientdet_lite0.tflite").resolve()).replace("\\", "/")
-
-    if not os.path.exists(OBJECT_MODEL_PATH):
-        # Fetch the official lightweight MediaPipe object detector on first start.
-        # This makes phone detection available on fresh Render deployments too.
-        import urllib.request
-        model_url = "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite"
-        model_temp = OBJECT_MODEL_PATH + ".download"
-        try:
-            print("Mobile phone detection: downloading EfficientDet-Lite0 model...")
-            with urllib.request.urlopen(model_url, timeout=15) as response, open(model_temp, "wb") as model_file:
-                shutil.copyfileobj(response, model_file)
-            if os.path.getsize(model_temp) < 1_000_000:
-                raise ValueError("Downloaded object detector model is unexpectedly small")
-            os.replace(model_temp, OBJECT_MODEL_PATH)
-            print("Mobile phone detection: model downloaded successfully")
-        except Exception as model_download_error:
-            try:
-                if os.path.exists(model_temp): os.remove(model_temp)
-            except OSError:
-                pass
-            print("Mobile phone detection: automatic model download failed:", model_download_error)
 
     if os.path.exists(OBJECT_MODEL_PATH):
 
@@ -961,7 +967,7 @@ except Exception as _phone_setup_error:
 
 def detect_phone_in_frame(frame):
     """Lightweight optional phone detector. It is called only after one face
-    has been found and on each monitoring frame, so it cannot overwhelm the
+    has been found and only every few AI frames, so it cannot overwhelm the
     student server or falsely classify a no-face frame as a phone warning."""
     global _phone_check_counter
     if not PHONE_DETECTION_AVAILABLE:
@@ -1006,15 +1012,6 @@ def analyze_face_frame(frame, monitor_key):
 
         state["total_frames"] += 1
 
-        # Run phone detection on every monitored frame, even when no face or
-        # multiple faces are visible. Debounce consecutive positive frames.
-        if PHONE_DETECTION_AVAILABLE:
-            phone_detected = detect_phone_in_frame(frame)
-        if phone_detected:
-            state["phone_bad_frames"] += 1
-        else:
-            state["phone_bad_frames"] = 0
-        phone_confirmed = state["phone_bad_frames"] >= PHONE_FRAME_CHECK
 
         # =====================================================
         # NO FACE
@@ -1075,7 +1072,17 @@ def analyze_face_frame(frame, monitor_key):
         state["no_face_frames"] = 0
         state["multiple_face_frames"] = 0
 
-        face_count = len(results.multi_face_landmarks)
+        face_count = len(
+            results.multi_face_landmarks
+        )
+
+        if face_count == 1 and PHONE_DETECTION_AVAILABLE:
+            phone_detected = detect_phone_in_frame(frame)
+        if phone_detected:
+            state["phone_bad_frames"] += 1
+        else:
+            state["phone_bad_frames"] = 0
+        phone_confirmed = state["phone_bad_frames"] >= PHONE_FRAME_CHECK
 
         # =====================================================
         # MULTIPLE FACES
@@ -1094,13 +1101,11 @@ def analyze_face_frame(frame, monitor_key):
 
             state["latest_stats"]["face_count"] = face_count
             state["latest_stats"]["status"] = "Multiple Faces"
-            state["latest_stats"]["warning"] = bool(multiple_faces_confirmed or phone_confirmed)
-            warning_messages = []
-            if multiple_faces_confirmed:
-                warning_messages.append("Other person detected. Only the student should be visible.")
-            if phone_confirmed:
-                warning_messages.append("Mobile phone detected. Please remove it.")
-            state["latest_stats"]["warning_message"] = " ".join(warning_messages)
+            state["latest_stats"]["warning"] = multiple_faces_confirmed
+            state["latest_stats"]["warning_message"] = (
+                "Other person detected. Only the student should be visible."
+                if multiple_faces_confirmed else ""
+            )
 
             return state["latest_stats"]
 
@@ -2054,84 +2059,37 @@ def student_login():
 @app.route("/student/dashboard")
 @student_login_required
 def student_dashboard():
-    # Read the same exam rows used by the shared Neon setup on Render.
-    shared_rows = _get_shared_exam_rows()
-    workbook = None
-    if shared_rows is None:
-        workbook = load_database()
-        exam_rows = list(workbook["Exams"].iter_rows(min_row=2, values_only=True))
-    else:
-        exam_rows = shared_rows
 
-    now = datetime.now()
+    workbook = load_database()
+
+    sheet = workbook["Exams"]
+
     subjects = {}
-    for row in exam_rows:
-        if not row or row[0] in (None, ""):
-            continue
-        exam_id = str(row[0])
-        if exam_id in subjects:
-            continue
 
-        from_raw = row[12] if len(row) > 12 else ""
-        until_raw = row[13] if len(row) > 13 else ""
-        opens_at = _dashboard_parse_datetime(from_raw)
-        closes_at = _dashboard_parse_datetime(until_raw)
+    for row in sheet.iter_rows(min_row=2, values_only=True):
 
-        # A result row for this student + exam means this attempt is consumed,
-        # whether completed normally or terminated for a policy violation.
-        finished = False
-        try:
-            results_wb = load_database()
-            if "Results" in results_wb.sheetnames:
-                result_sheet = results_wb["Results"]
-                headers = [str(c.value or "").strip().lower() for c in result_sheet[1]]
-                student_col = headers.index("student id") if "student id" in headers else 1
-                exam_col = headers.index("exam id") if "exam id" in headers else 3
-                for result_row in result_sheet.iter_rows(min_row=2, values_only=True):
-                    if (len(result_row) > max(student_col, exam_col)
-                        and str(result_row[student_col]) == str(session.get("student_id", ""))
-                        and str(result_row[exam_col]) == exam_id):
-                        finished = True
-                        break
-            results_wb.close()
-        except Exception as exc:
-            print("[DASHBOARD] Could not check previous attempts:", exc)
+        exam_id = row[0]
+        subject_name = row[3]
+        subject_code = row[4]
+        teacher_name = row[2]
 
-        is_future = bool(opens_at and now < opens_at)
-        is_expired = bool(closes_at and now > closes_at)
-        can_start = not finished and not is_future and not is_expired
-        live = can_start
-        subjects[exam_id] = {
-            "exam_id": exam_id,
-            "subject_name": row[3] if len(row) > 3 else "",
-            "subject_code": row[4] if len(row) > 4 else "",
-            "teacher_name": row[2] if len(row) > 2 else "",
-            "finished": finished,
-            "can_start": can_start,
-            "live": live,
-            "countdown_target": opens_at.isoformat() if opens_at and is_future and not finished else "",
-            "opens_at_label": opens_at.strftime("%d %b %Y, %I:%M:%S %p") if opens_at else "",
-            "expired": is_expired,
-        }
+        if exam_id not in subjects:
 
-    if workbook is not None:
-        workbook.close()
+            subjects[exam_id] = {
+                "exam_id": exam_id,
+                "subject_name": subject_name,
+                "subject_code": subject_code,
+                "teacher_name": teacher_name
+            }
 
-    return render_template("student_dashboard.html", subjects=list(subjects.values()))
+    workbook.close()
 
+    subject_list = list(subjects.values())
 
-def _dashboard_parse_datetime(raw_value):
-    if isinstance(raw_value, datetime):
-        return raw_value
-    if not raw_value:
-        return None
-    raw = str(raw_value).strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-        try:
-            return datetime.strptime(raw, fmt)
-        except ValueError:
-            pass
-    return None
+    return render_template(
+        "student_dashboard.html",
+        subjects=subject_list
+    )
 
 
 # ============================================================
@@ -2331,41 +2289,37 @@ def _queue_recording_finalize_for_admin(exam_id, student_id, filename, token, ex
     threading.Thread(target=worker, daemon=True, name="recording-finalize-sync").start()
 
 
-def _queue_recording_for_admin(path, exam_id, student_id, filename, try_immediately=True):
-    if not path or not os.path.isfile(path):
-        print("[SYNC] Cannot queue recording: local recording file is missing.")
-        return False
-    filename = _safe_admin_filename(filename)
-    marker = os.path.join(ADMIN_SYNC_FOLDER, filename + ".json")
-    _write_recording_receipt(student_id, exam_id, filename, "pending")
+def _queue_recording_for_admin(path,exam_id,student_id,filename,try_immediately=True):
+    if not path or not os.path.isfile(path): return
+    filename=_safe_admin_filename(filename); marker=os.path.join(ADMIN_SYNC_FOLDER,filename+".json")
     try:
-        with open(marker, "w", encoding="utf-8") as fh:
-            json.dump({"path": path, "exam_id": str(exam_id), "student_id": str(student_id), "filename": filename}, fh)
-    except Exception as exc:
-        print("[SYNC] recording queue marker:", exc)
-    if try_immediately and _post_recording_to_admin(path, exam_id, student_id, filename):
-        _write_recording_receipt(student_id, exam_id, filename, "received")
+        with open(marker,"w",encoding="utf-8") as fh: json.dump({"path":path,"exam_id":str(exam_id),"student_id":str(student_id),"filename":filename},fh)
+    except Exception as e: print("[SYNC] recording queue:",e)
+
+    # FIX: previously this only ever synced to admin on a background
+    # thread with the first attempt starting after some delay — the
+    # video could sit unsynced for a while, and if the student's
+    # computer/app was shut down soon after they saw their results,
+    # it might never get there at all. Since the request that calls
+    # this (finalize) is a good moment to actually wait a few seconds
+    # for it, try once, right now, before falling back to the same
+    # durable background retry queue as before for resilience against
+    # a slow/flaky connection.
+    if try_immediately and _post_recording_to_admin(path,exam_id,student_id,filename):
         try: os.remove(marker)
         except OSError: pass
-        print("[SYNC] Admin confirmed recording receipt:", filename)
-        return True
+        print("[SYNC] Recording synced to admin immediately:",filename)
+        return
+
     def worker():
-        last_error = "Admin service did not confirm the recording."
-        for attempt in range(1, 16):
-            try:
-                if _post_recording_to_admin(path, exam_id, student_id, filename):
-                    _write_recording_receipt(student_id, exam_id, filename, "received")
-                    try: os.remove(marker)
-                    except OSError: pass
-                    print("[SYNC] Admin confirmed recording receipt:", filename)
-                    return
-            except Exception as exc:
-                last_error = str(exc)
-            time.sleep(min(12, attempt * 2))
-        _write_recording_receipt(student_id, exam_id, filename, "failed", last_error)
-        print("[SYNC] Recording remains unsynced after retries:", filename)
-    threading.Thread(target=worker, daemon=True, name="recording-admin-sync").start()
-    return False
+        for attempt in range(1,13):
+            if _post_recording_to_admin(path,exam_id,student_id,filename):
+                try: os.remove(marker)
+                except OSError: pass
+                print("[SYNC] Recording synced to admin:",filename); return
+            time.sleep(min(10,attempt*2))
+        print("[SYNC] Recording remains queued:",filename)
+    threading.Thread(target=worker,daemon=True).start()
 
 def _queue_result_for_admin(payload):
     if not ADMIN_SYNC_TOKEN or ADMIN_SYNC_TOKEN=="CHANGE_THIS_SHARED_RECORDING_SYNC_TOKEN": return
@@ -2929,43 +2883,37 @@ def submit_exam(exam_id):
     })
 
     # =========================================================
-    # RESULT PRIVACY: score, correct answers and question details stay
-    # in the teacher/admin result store and are never rendered to students.
+    # DISPLAY RESULT
     # =========================================================
-    completion_html = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Exam Completed</title><style>
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:#0b1220;color:#f8fafc;font:16px Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{width:min(680px,100%);background:#111827;border:1px solid #334155;border-radius:18px;padding:28px;box-shadow:0 20px 70px #0007}
-h1{margin-top:0}p{line-height:1.5;color:#cbd5e1}.status{padding:12px;border-radius:10px;background:#172554;margin:16px 0;color:#dbeafe}
-#eg-vkbd-input{width:100%;padding:12px;background:#020617;color:white;border:1px solid #64748b;border-radius:8px;font-size:18px;margin:8px 0 12px}
-#eg-vkbd-keys{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:5px}
-button{cursor:pointer;border:1px solid #64748b;border-radius:7px;background:#334155;color:white;padding:10px 3px;font-weight:700;min-height:38px}
-button:disabled{opacity:.45;cursor:not-allowed}.wide{grid-column:span 2}.actions{display:flex;gap:8px;margin-top:10px}.actions button{flex:1}
-#eg-vkbd-status{margin-top:12px;min-height:22px;color:#fbbf24}.ok{color:#86efac!important}
-@media(max-width:500px){.card{padding:16px}#eg-vkbd-keys{gap:3px}button{font-size:11px;padding:7px 1px}}
-</style></head><body><main class="card">
-<h1>Exam Completed</h1>
-<p>Your answers have been submitted. Your score and answer review are available only to your teacher/admin.</p>
-<div class="status" id="eg-vkbd-help">The physical keyboard remains locked on this page until the admin server confirms the recording and an authorized teacher enters the password.</div>
-<h2>Teacher-authorized keyboard unlock</h2><p>Use the mouse to enter the authorized password. Unlock is enabled only after the recording has been received by the admin server.</p>
-<input id="eg-vkbd-input" type="password" autocomplete="off" readonly aria-label="Teacher unlock password" placeholder="Enter password using the on-screen keys">
-<div id="eg-vkbd-keys"></div><div class="actions"><button type="button" id="eg-vkbd-back">⌫ Backspace</button><button type="button" id="eg-vkbd-clear">Clear</button><button type="button" id="eg-vkbd-unlock" disabled>Unlock keyboard</button></div><div id="eg-vkbd-status" role="status">Waiting for admin recording receipt…</div>
-</main><script>
-(function(){
- const examId={{ exam_id|tojson }},input=document.getElementById('eg-vkbd-input'),keys=document.getElementById('eg-vkbd-keys'),status=document.getElementById('eg-vkbd-status'),unlock=document.getElementById('eg-vkbd-unlock');
- let received=false,unlocked=false,shifted=false;const rows=['1234567890','qwertyuiop','asdfghjkl','zxcvbnm'];
- function say(t,ok){status.textContent=t;status.classList.toggle('ok',!!ok)}
- function addKey(label,value,extra){const b=document.createElement('button');b.type='button';b.textContent=label;if(extra)b.className=extra;b.onclick=()=>{if(unlocked)return;if(value==='SHIFT'){shifted=!shifted;renderKeys();return}input.value+=shifted?value.toUpperCase():value;shifted=false;renderKeys()};keys.appendChild(b)}
- function renderKeys(){keys.replaceChildren();rows.forEach(row=>{for(const ch of row)addKey(shifted?ch.toUpperCase():ch,ch)});addKey(shifted?'Shift ✓':'Shift','SHIFT','wide');['@','_','-','.'].forEach(ch=>addKey(ch,ch))}
- renderKeys();document.getElementById('eg-vkbd-back').onclick=()=>{input.value=input.value.slice(0,-1)};document.getElementById('eg-vkbd-clear').onclick=()=>{input.value='';say(received?'Enter the authorized password.':'Waiting for admin recording receipt…')};
- async function checkReceipt(){try{const r=await fetch('/student/exam/recording-receipt/'+encodeURIComponent(examId),{credentials:'same-origin',cache:'no-store'});const d=await r.json();received=!!d.received;unlock.disabled=!received;if(received)say('Admin server confirmed the recording. Teacher password required.',true);else say(d.status==='failed'?'Recording transfer failed. Contact the administrator.':'Waiting for admin recording receipt…')}catch(e){unlock.disabled=true;say('Cannot verify admin recording receipt yet.')}}
- unlock.onclick=async()=>{if(!received||!input.value)return;unlock.disabled=true;say('Checking authorized password…');try{const r=await fetch('/student/exam/keyboard-unlock',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({exam_id:examId,password:input.value,source:'virtual_keyboard'})});const d=await r.json();if(d.unlocked){unlocked=true;input.value='';say('Authorized. Keyboard unlocked.',true);document.removeEventListener('keydown',blockPhysical,true);document.removeEventListener('keypress',blockPhysical,true);document.removeEventListener('keyup',blockPhysical,true);document.getElementById('eg-vkbd-help').textContent='Keyboard unlocked by an authorized teacher.';keys.querySelectorAll('button').forEach(b=>b.disabled=true);document.getElementById('eg-vkbd-back').disabled=true;document.getElementById('eg-vkbd-clear').disabled=true;unlock.textContent='Unlocked'}else{input.value='';say(d.reason==='recording_not_received'?'Admin has not confirmed the recording yet.':'Incorrect password. Try again.')}}catch(e){say('Password verification failed. Try again.')}finally{if(!unlocked)unlock.disabled=!received}};
- function blockPhysical(e){if(unlocked)return;e.preventDefault();e.stopImmediatePropagation();e.stopPropagation();return false}
- document.addEventListener('keydown',blockPhysical,true);document.addEventListener('keypress',blockPhysical,true);document.addEventListener('keyup',blockPhysical,true);checkReceipt();setInterval(()=>{if(!unlocked)checkReceipt()},1500)
-})();
-</script></body></html>"""
-    return render_template_string(completion_html, exam_id=str(exam_id))
+
+    return render_template(
+
+        "student_result.html",
+
+        result_id=result_id,
+
+        exam_id=exam_id,
+
+        subject_name=subject_name,
+
+        subject_code=subject_code,
+
+        questions=result_questions,
+
+        total_questions=total_questions,
+
+        correct_count=correct_count,
+
+        wrong_count=wrong_count,
+
+        unattempted_count=unattempted_count,
+
+        percentage=percentage,
+
+        exam_status=exam_status
+
+    )
+
 
 
 # ============================================================
@@ -3105,15 +3053,6 @@ def upload_exam_recording_chunk(exam_id):
                 shutil.copyfileobj(video.stream, out_file, length=1024 * 1024)
         meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
         _save_recording_meta(part_dir, meta)
-
-        # Server-side receipt marker: keyboard unlock is unavailable until at
-        # least one valid recording chunk has reached this server for this exam.
-        received = session.get("recording_received_exam_ids", [])
-        if not isinstance(received, list):
-            received = []
-        if str(exam_id) not in [str(x) for x in received]:
-            received.append(str(exam_id))
-        session["recording_received_exam_ids"] = received[-50:]
 
         # FIX (real bug — root cause of "sometimes corrupted"): this
         # used to also push every individual chunk to the admin server
@@ -3469,7 +3408,7 @@ def student_live_frame():
             "status": stats.get("status", "Monitoring"),
             "warning": bool(stats.get("warning", False)),
             "warning_message": stats.get("warning_message", ""),
-            "student_signal_base_url": f"https://{_local_lan_ip()}:5000"
+            "student_signal_base_url": _student_public_signal_base_url()
         }
         status_path = os.path.join(LIVE_FRAMES_FOLDER, f"{safe_id}.json")
         status_tmp = status_path + ".uploading"
@@ -3524,7 +3463,7 @@ def live_presence():
             "status": "Live",
             "warning": False,
             "warning_message": "",
-            "student_signal_base_url": f"https://{_local_lan_ip()}:5000",
+            "student_signal_base_url": _student_public_signal_base_url(),
         }
         _schedule_live_heartbeat_sync(sid, payload)
         return jsonify({"success": True})
@@ -3872,45 +3811,26 @@ def internal_voice_clear(student_id):
     return jsonify({"success": True})
 
 
-@app.route("/student/exam/recording-receipt/<exam_id>", methods=["GET"])
-@student_login_required
-def recording_receipt_status(exam_id):
-    student_id = str(session.get("student_id", ""))
-    result_exam = str(session.get("result_lock_exam_id", ""))
-    active_exam = str(session.get("current_exam_id", ""))
-    allowed_exam = result_exam or active_exam
-    if str(exam_id) != allowed_exam:
-        return jsonify({"received": False, "status": "wrong_exam"}), 403
-    try:
-        with open(_recording_receipt_path(student_id, exam_id), "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        received = (payload.get("status") == "received"
-                    and str(payload.get("student_id")) == student_id
-                    and str(payload.get("exam_id")) == str(exam_id)
-                    and bool(payload.get("filename")))
-        return jsonify({"received": bool(received),
-                        "status": "received" if received else str(payload.get("status", "pending")),
-                        "error": str(payload.get("error", "")) if payload.get("status") == "failed" else ""})
-    except (OSError, ValueError, TypeError):
-        return jsonify({"received": False, "status": "pending"})
-
 @app.route("/student/exam/keyboard-unlock", methods=["POST"])
 @student_login_required
 def keyboard_unlock():
-    """Allow keyboard unlock only after exam completion and admin receipt."""
+    """Validate the teacher unlock password without exposing it to the browser."""
     data = request.get_json(silent=True) or {}
     exam_id = str(data.get("exam_id", "")).strip()
     candidate = str(data.get("password", ""))
+
+    current_exam = str(session.get("current_exam_id", ""))
     result_exam = str(session.get("result_lock_exam_id", ""))
-    if not exam_id or not result_exam or exam_id != result_exam:
-        return jsonify({"success": False, "unlocked": False, "reason": "exam_not_finished"}), 403
-    if data.get("source") != "virtual_keyboard":
-        return jsonify({"success": False, "unlocked": False, "reason": "virtual_keyboard_required"}), 403
-    if not _admin_recording_receipt_received(session.get("student_id", ""), exam_id):
-        return jsonify({"success": True, "unlocked": False, "reason": "recording_not_received"}), 409
-    unlocked = bool(KEYBOARD_UNLOCK_PASSWORD and candidate == KEYBOARD_UNLOCK_PASSWORD)
-    if unlocked: session.pop("result_lock_exam_id", None)
+    if not exam_id or exam_id not in (current_exam, result_exam):
+        return jsonify({"success": False, "unlocked": False}), 403
+
+    # Only the server knows the real password.
+    unlocked = bool(KEYBOARD_UNLOCK_PASSWORD and KEYBOARD_UNLOCK_PASSWORD != ""
+                    and candidate == KEYBOARD_UNLOCK_PASSWORD)
+    if unlocked and result_exam and exam_id == result_exam:
+        session.pop("result_lock_exam_id", None)
     return jsonify({"success": True, "unlocked": unlocked})
+
 
 @app.route("/student/exam/<exam_id>")
 @student_login_required
@@ -3953,13 +3873,9 @@ def start_exam(exam_id):
 
     results_workbook.close()
 
-    shared_rows = _get_shared_exam_rows()
-    workbook = None
-    if shared_rows is None:
-        workbook = load_database()
-        exam_rows = list(workbook["Exams"].iter_rows(min_row=2, values_only=True))
-    else:
-        exam_rows = shared_rows
+    workbook = load_database()
+
+    sheet = workbook["Exams"]
 
     questions = []
 
@@ -3971,9 +3887,12 @@ def start_exam(exam_id):
     duration_minutes = 30
 
 
-    for row in exam_rows:
+    for row in sheet.iter_rows(
+        min_row=2,
+        values_only=True
+    ):
 
-        if str(row[0]) == str(exam_id):
+        if row[0] == exam_id:
 
             subject_name = row[3]
 
@@ -4012,8 +3931,7 @@ def start_exam(exam_id):
             })
 
 
-    if workbook is not None:
-        workbook.close()
+    workbook.close()
 
 
     if not questions:
@@ -5408,8 +5326,6 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
     }
   }
 
-  window.addEventListener('examguard:keyboard-unlocked', setKeyboardUnlocked);
-
   window.__aiShowResultLock = function(){
     examStarted = false;
     examEnding = false;
@@ -6154,11 +6070,6 @@ setInterval(tick,250);
             if "ai-exam-timer" not in body and "</body>" in body:
                 body = body.replace("</body>", timer_script + "</body>")
 
-            finish_script = r"""<script>
-(function(){function fix(){const all=[...document.querySelectorAll('button,input[type=submit],input[type=button],a')];const matches=all.filter(el=>{const t=(el.innerText||el.value||'').trim().toLowerCase();return /^(finish|finished|finish exam|submit exam)$/.test(t)});if(!matches.length)return;const keep=matches[0];if(keep.tagName==='INPUT'){if(keep.value!=='Finished')keep.value='Finished'}else if((keep.textContent||'').trim()!=='Finished')keep.textContent='Finished';keep.style.background='#dc2626';keep.style.color='#fff';keep.style.border='1px solid #b91c1c';keep.style.fontWeight='700';matches.slice(1).forEach(el=>el.remove());}fix();new MutationObserver(fix).observe(document.body,{childList:true,subtree:true});})();
-</script>"""
-            if "</body>" in body and "examguard-single-finished-control" not in body:
-                body = body.replace("</body>", "<!--examguard-single-finished-control-->" + finish_script + "</body>")
             response.set_data(body)
 
         # Applied to every student page EXCEPT the live exam page
@@ -6172,23 +6083,6 @@ setInterval(tick,250);
             and not response.is_streamed
         ):
             body = response.get_data(as_text=True)
-
-            # Clean up the stray literal "html" artifact on login pages.
-            if request.path.rstrip("/") in ("/student/login", "/student/register"):
-                cleanup_script = r"""<script>
-(function(){function clean(){const w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){if((n.nodeValue||'').trim().toLowerCase()==='html')n.nodeValue='';}}if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',clean);else clean();})();
-</script>"""
-                if "</body>" in body and "examguard-clean-html-artifact" not in body:
-                    body = body.replace("</body>", "<!--examguard-clean-html-artifact-->" + cleanup_script + "</body>")
-
-            # Dashboard only: remove a Home navigation control if a template still has one.
-            if request.path.rstrip("/") == "/student/dashboard":
-                dashboard_script = r"""<script>
-(function(){document.querySelectorAll('a,button').forEach(el=>{if((el.textContent||'').trim().toLowerCase()==='home')el.remove();});})();
-</script>"""
-                if "</body>" in body and "examguard-dashboard-home-cleanup" not in body:
-                    body = body.replace("</body>", "<!--examguard-dashboard-home-cleanup-->" + dashboard_script + "</body>")
-
             if "ai-dashboard-bg-applied" not in body:
                 marker = "<!--ai-dashboard-bg-applied-->"
                 if "</head>" in body:

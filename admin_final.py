@@ -1122,43 +1122,66 @@ def login():
 @app.route("/dashboard")
 @teacher_login_required
 def dashboard():
-
     teacher_id = session["teacher_id"]
-
-    workbook = load_database()
-
-    sheet = workbook["Exams"]
-
     exams = {}
 
-    for row in sheet.iter_rows(min_row=2, values_only=True):
+    # On Render, use the same shared Neon database as the Student service.
+    # This prevents the dashboard from showing stale rows from database.xlsx.
+    if os.environ.get("DATABASE_URL", "").strip():
+        conn = None
+        try:
+            conn = _shared_db_connection()
+            if conn is None:
+                raise RuntimeError("DATABASE_URL is not configured")
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.exams")
+                rows = cur.fetchall()
 
-        exam_id = row[0]
-
-        if row[1] == teacher_id:
-
-            if exam_id not in exams:
-
-                exams[exam_id] = {
-                    "exam_id": exam_id,
-                    "subject_name": row[3],
-                    "subject_code": row[4],
-                    "teacher_name": row[2],
-                    "question_count": 0
-                }
-
-            exams[exam_id]["question_count"] += 1
-
-    workbook.close()
+            for row in rows:
+                if len(row) < 15:
+                    continue
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exam_id = row[0]
+                if exam_id not in exams:
+                    exams[exam_id] = {
+                        "exam_id": exam_id,
+                        "subject_name": row[3],
+                        "subject_code": row[4],
+                        "teacher_name": row[2],
+                        "question_count": 0,
+                    }
+                exams[exam_id]["question_count"] += 1
+        except Exception:
+            app.logger.exception("Failed to load teacher dashboard exams from Neon")
+            flash("Could not load exams from the shared database. Please try again.", "error")
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        # Keep Excel behavior for local development without DATABASE_URL.
+        workbook = load_database()
+        try:
+            sheet = workbook["Exams"]
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                exam_id = row[0]
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                if exam_id not in exams:
+                    exams[exam_id] = {
+                        "exam_id": exam_id,
+                        "subject_name": row[3],
+                        "subject_code": row[4],
+                        "teacher_name": row[2],
+                        "question_count": 0,
+                    }
+                exams[exam_id]["question_count"] += 1
+        finally:
+            workbook.close()
 
     exam_list = list(exams.values())
-
     exam_list.reverse()
-
-    return render_template(
-        "dashboard.html",
-        exams=exam_list
-    )
+    return render_template("dashboard.html", exams=exam_list)
 
 
 # ============================================================
@@ -1431,18 +1454,54 @@ def create_exam():
 @teacher_login_required
 def manage_exams():
     teacher_id = session["teacher_id"]
-    workbook = load_database()
-    sheet = workbook["Exams"]
     exams = {}
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        if row[1] == teacher_id:
-            exams.setdefault(row[0], {
-                "exam_id": row[0], "subject_name": row[3],
-                "subject_code": row[4], "question_count": 0,
-                "duration_minutes": row[14] if len(row) > 14 and row[14] else 30,
-            })
-            exams[row[0]]["question_count"] += 1
-    workbook.close()
+
+    # Match the Student service's shared Neon data on Render.
+    if os.environ.get("DATABASE_URL", "").strip():
+        conn = None
+        try:
+            conn = _shared_db_connection()
+            if conn is None:
+                raise RuntimeError("DATABASE_URL is not configured")
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.exams")
+                rows = cur.fetchall()
+
+            for row in rows:
+                if len(row) < 15 or str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exam_id = row[0]
+                exams.setdefault(exam_id, {
+                    "exam_id": exam_id,
+                    "subject_name": row[3],
+                    "subject_code": row[4],
+                    "question_count": 0,
+                    "duration_minutes": row[14] if row[14] else 30,
+                })
+                exams[exam_id]["question_count"] += 1
+        except Exception:
+            app.logger.exception("Failed to load managed exams from Neon")
+            flash("Could not load exams from the shared database. Please try again.", "error")
+        finally:
+            if conn is not None:
+                conn.close()
+    else:
+        # Keep Excel behavior for local development without DATABASE_URL.
+        workbook = load_database()
+        try:
+            sheet = workbook["Exams"]
+            for row in sheet.iter_rows(min_row=2, values_only=True):
+                if str(row[1]).strip() != str(teacher_id).strip():
+                    continue
+                exams.setdefault(row[0], {
+                    "exam_id": row[0], "subject_name": row[3],
+                    "subject_code": row[4], "question_count": 0,
+                    "duration_minutes": row[14] if len(row) > 14 and row[14] else 30,
+                })
+                exams[row[0]]["question_count"] += 1
+        finally:
+            workbook.close()
+
     return render_template("manage_exams.html", exams=list(exams.values()))
 
 
@@ -3055,79 +3114,71 @@ def admin_subject_results(subject_code):
 @app.route("/admin/dashboard")
 #@admin_login_required
 def admin_dashboard():
-
-    workbook = load_database()
-
-    exam_sheet = workbook["Exams"]
-
     subjects = {}
+    conn = None
 
+    # Prefer the shared Neon exam store so Admin sees the same exams as Student.
+    if os.environ.get("DATABASE_URL", "").strip():
+        try:
+            conn = _shared_db_connection()
+            if conn is not None:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT DISTINCT exam_id, teacher_name, subject_name, subject_code
+                        FROM public.exams
+                        ORDER BY subject_code, subject_name, exam_id
+                    """)
+                    rows = cur.fetchall()
+                for exam_id, teacher_name, subject_name, subject_code in rows:
+                    key = subject_code or subject_name or "Unknown"
+                    if key not in subjects:
+                        subjects[key] = {
+                            "subject_code": subject_code,
+                            "subject_name": subject_name,
+                            "teacher_names": set(),
+                            "exam_ids": [],
+                        }
+                    if teacher_name:
+                        subjects[key]["teacher_names"].add(teacher_name)
+                    if exam_id and exam_id not in subjects[key]["exam_ids"]:
+                        subjects[key]["exam_ids"].append(exam_id)
+        except Exception:
+            app.logger.exception("Could not load Admin dashboard exams from Neon")
+            subjects.clear()
+        finally:
+            if conn is not None:
+                conn.close()
 
-    for row in exam_sheet.iter_rows(
-        min_row=2,
-        values_only=True
-    ):
-
-        exam_id = row[0]
-
-        teacher_id = row[1]
-
-        teacher_name = row[2]
-
-        subject_name = row[3]
-
-        subject_code = row[4]
-
-
-        key = subject_code
-
-
-        if key not in subjects:
-
-            subjects[key] = {
-
-                "subject_code": subject_code,
-
-                "subject_name": subject_name,
-
-                "teacher_names": set(),
-
-                "exam_ids": []
-
-            }
-
-
-        subjects[key]["teacher_names"].add(
-            teacher_name
-        )
-
-
-        if exam_id not in subjects[key]["exam_ids"]:
-
-            subjects[key]["exam_ids"].append(
-                exam_id
-            )
-
-
-    workbook.close()
-
-
-    # Convert set to string
+    # Fallback for local development when DATABASE_URL is not configured,
+    # or if the shared database query fails.
+    if not subjects:
+        workbook = load_database(read_only=True, data_only=True)
+        try:
+            exam_sheet = workbook["Exams"]
+            for row in exam_sheet.iter_rows(min_row=2, values_only=True):
+                exam_id = row[0]
+                teacher_name = row[2]
+                subject_name = row[3]
+                subject_code = row[4]
+                key = subject_code or subject_name or "Unknown"
+                if key not in subjects:
+                    subjects[key] = {
+                        "subject_code": subject_code,
+                        "subject_name": subject_name,
+                        "teacher_names": set(),
+                        "exam_ids": [],
+                    }
+                if teacher_name:
+                    subjects[key]["teacher_names"].add(teacher_name)
+                if exam_id and exam_id not in subjects[key]["exam_ids"]:
+                    subjects[key]["exam_ids"].append(exam_id)
+        finally:
+            workbook.close()
 
     for subject in subjects.values():
+        subject["teacher_names"] = ", ".join(sorted(subject["teacher_names"]))
 
-        subject["teacher_names"] = ", ".join(
-            subject["teacher_names"]
-        )
-
-
-    return render_template(
-
-        "admin_dashboard.html",
-
-        subjects=list(subjects.values())
-
-    )
+    return render_template("admin_dashboard.html", subjects=list(subjects.values()))
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
@@ -3585,6 +3636,9 @@ def admin_live():
             if(st) st.textContent='WAITING FOR CAMERA';
             const pc=videoPeerConnections.get(id); if(pc){try{pc.close();}catch(_){}}
             videoPeerConnections.delete(id);
+            // A failed first attempt must not leave the card stuck forever.
+            // Retry while this student's live card is still present.
+            setTimeout(()=>{ if(document.getElementById(safeDomId(id))) startVideoPeer(s); },2500);
           }finally{ videoOfferBusy.delete(id); }
         }
 
@@ -3903,9 +3957,20 @@ def _student_video_base_url(student_id):
         if str(sess.get("student_id", "")) == str(student_id):
             base = str(sess.get("student_signal_base_url", "")).strip().rstrip("/")
             if base:
+                # Render terminates HTTPS at its proxy. A Flask-generated
+                # request.url_root can otherwise be http://, which can break
+                # POST-based WebRTC signaling after an HTTPS redirect.
+                if base.startswith("http://") and (
+                    ".onrender.com" in base.lower()
+                    or os.environ.get("RENDER", "").strip().lower() == "true"
+                ):
+                    base = "https://" + base[len("http://"):]
                 return base
             break
-    return STUDENT_SIGNAL_BASE_URL.rstrip("/")
+    base = STUDENT_SIGNAL_BASE_URL.rstrip("/")
+    if base.startswith("http://") and ".onrender.com" in base.lower():
+        base = "https://" + base[len("http://"):]
+    return base
 
 
 def _student_video_headers():

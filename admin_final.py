@@ -77,20 +77,333 @@ def _shared_delete_exam(exam_id):
 # admin_app.py proxies WebRTC signaling to student_app.py.  The
 # browser-to-browser audio itself uses WebRTC; the Flask endpoints
 # only exchange offer/answer messages.
-STUDENT_SIGNAL_BASE_URL = os.environ.get(
-    "STUDENT_SIGNAL_BASE_URL", "https://127.0.0.1:5000"
-).rstrip("/")
+import threading
+from pathlib import Path
+from flask import render_template_string
+
+ON_RENDER = (
+    os.environ.get("RENDER", "").strip().lower() == "true"
+    or bool(os.environ.get("RENDER_EXTERNAL_URL", "").strip())
+)
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+
+def _ice_servers():
+    """ICE servers for WebRTC (add a TURN server through ICE_SERVERS_JSON for
+    strict college firewalls)."""
+    raw = os.environ.get("ICE_SERVERS_JSON", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and parsed:
+                return parsed
+        except Exception as exc:
+            print("[ICE] ICE_SERVERS_JSON ignored:", exc)
+    return [
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
+        {"urls": "stun:stun.cloudflare.com:3478"},
+    ]
+
+
+def _live_form_extras():
+    """Violation counters sent by the student server with every heartbeat/frame."""
+    try: count = int(str(request.form.get("violation_count", "0") or "0"))
+    except ValueError: count = 0
+    return {
+        "violation_count": count,
+        "last_violation": str(request.form.get("last_violation", ""))[:240],
+        "terminated": str(request.form.get("terminated", "false")).lower() in ("1", "true", "yes", "on"),
+    }
+
+
+STUDENT_SIGNAL_BASE_URL = (
+    os.environ.get("STUDENT_SIGNAL_BASE_URL", "").strip().rstrip("/")
+    or ("https://smart-exam-student.onrender.com" if ON_RENDER else "https://127.0.0.1:5000")
+)
 VOICE_SIGNAL_TOKEN = os.environ.get(
     "VOICE_SIGNAL_TOKEN", "CHANGE_THIS_SHARED_VOICE_TOKEN"
 )
 STUDENT_SIGNAL_VERIFY_SSL = os.environ.get(
-    "STUDENT_SIGNAL_VERIFY_SSL", "false"
+    "STUDENT_SIGNAL_VERIFY_SSL", "true" if ON_RENDER else "false"
 ).strip().lower() in ("1", "true", "yes", "on")
 
 
 app = Flask(__name__)
 
 app.secret_key = "admin_teacher_management_system_secret_key"
+
+
+# ============================================================
+# ZOOM LOCK (all pages): the page always stays at 100 %
+# ============================================================
+ZOOM_LOCK_SNIPPET = r"""<!--eg-zoom-lock--><script>
+(function(){
+  function stop(e){ try{ e.preventDefault(); e.stopPropagation(); }catch(x){} }
+  // Ctrl + mouse wheel / touchpad pinch
+  window.addEventListener('wheel', function(e){ if (e.ctrlKey || e.metaKey) stop(e); }, {passive:false, capture:true});
+  // Ctrl + / Ctrl - / Ctrl 0 (also the number pad)
+  window.addEventListener('keydown', function(e){
+    if (!(e.ctrlKey || e.metaKey)) return;
+    var k = e.key, c = e.code;
+    if (k==='+'||k==='-'||k==='='||k==='_'||k==='0'||k==='Add'||k==='Subtract'||
+        c==='Equal'||c==='Minus'||c==='Digit0'||c==='NumpadAdd'||c==='NumpadSubtract'||c==='Numpad0') stop(e);
+  }, true);
+  // Pinch on touch screens / Safari gestures
+  ['gesturestart','gesturechange','gestureend'].forEach(function(n){ document.addEventListener(n, stop, {passive:false}); });
+  document.addEventListener('touchmove', function(e){ if (e.touches && e.touches.length > 1) stop(e); }, {passive:false});
+  // Zoom changed from the browser menu cannot be blocked, so cancel it by
+  // scaling the page back to the size it had when it opened.
+  var STEPS=[.25,.33,.5,.67,.75,.8,.9,1,1.1,1.25,1.5,1.75,2,2.5,3,4,5];
+  function browserZoom(){
+    var o=window.outerWidth, i=window.innerWidth;
+    if(!o||!i) return 1;
+    var r=o/i, best=1, d=9;
+    STEPS.forEach(function(s){ var x=Math.abs(r-s)/s; if(x<d){d=x;best=s;} });
+    return d<0.06 ? best : 1;
+  }
+  function compensate(){
+    var z=browserZoom(), root=document.documentElement;
+    if (Math.abs(z-1) < 0.02) { if (root.style.zoom) root.style.zoom = ''; }
+    else { root.style.zoom = String(1/z); }
+  }
+  compensate();
+  window.addEventListener('resize', compensate);
+  setInterval(compensate, 400);
+})();
+</script>"""
+
+
+@app.after_request
+def eg_zoom_lock(response):
+    try:
+        if (request.method == "GET" and response.status_code == 200
+                and "text/html" in (response.content_type or "") and not response.is_streamed):
+            body = response.get_data(as_text=True)
+            if "eg-zoom-lock" in body:
+                return response
+            body = body.replace('content="width=device-width, initial-scale=1"',
+                                'content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"')
+            import re as _re_zoom
+            m = _re_zoom.search(r"<head[^>]*>", body, _re_zoom.I)
+            if m:
+                body = body[:m.end()] + ZOOM_LOCK_SNIPPET + body[m.end():]
+            elif "</body>" in body:
+                body = body.replace("</body>", ZOOM_LOCK_SNIPPET + "</body>")
+            else:
+                body = ZOOM_LOCK_SNIPPET + body
+            response.set_data(body)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("[UI] zoom lock skipped:", exc)
+    return response
+
+
+# ============================================================
+# 3D LOOK (all normal pages): depth layers, tilting glass cards, 3D buttons
+# ------------------------------------------------------------
+# Injected just before </body> so it works for every page without touching the
+# templates. It is skipped on exam / live-monitoring / video pages so the
+# camera, recording and live wall keep all the computer's power.
+# ============================================================
+EG_3D_SNIPPET = r"""<!--eg-3d-look--><style id="eg3d-css">
+body::before,body::after{opacity:0 !important}
+html{background-color:#0a0e1a;min-height:100%}body{min-height:100vh}
+#eg3d-scene{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;perspective:1100px;perspective-origin:50% 38%}
+.eg3d-orb{position:absolute;transform:translate3d(calc(var(--mx,0)*var(--d,20)*1px),calc(var(--my,0)*var(--d,20)*1px),0)}
+.eg3d-orb>i{display:block;width:100%;height:100%;border-radius:50%;
+  background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.60) 0,rgba(205,190,255,.38) 14%,rgba(124,92,255,.30) 42%,rgba(60,40,150,.10) 66%,rgba(20,10,70,0) 74%);
+  box-shadow:inset -14px -18px 46px rgba(15,8,60,.60),0 34px 90px rgba(124,92,255,.22);
+  animation:egFloat var(--t,14s) ease-in-out infinite alternate}
+.eg3d-orb.pink>i{background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.55) 0,rgba(255,200,225,.34) 14%,rgba(255,111,164,.26) 42%,rgba(120,30,90,.10) 66%,rgba(40,10,40,0) 74%);box-shadow:inset -14px -18px 46px rgba(60,8,40,.55),0 34px 90px rgba(255,111,164,.18)}
+.eg3d-orb.blue>i{background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.55) 0,rgba(190,225,255,.34) 14%,rgba(79,160,255,.26) 42%,rgba(20,60,130,.10) 66%,rgba(10,20,60,0) 74%);box-shadow:inset -14px -18px 46px rgba(8,25,70,.55),0 34px 90px rgba(79,160,255,.18)}
+@keyframes egFloat{0%{transform:translate3d(0,0,0) scale(1)}100%{transform:translate3d(0,-34px,0) scale(1.05)}}
+.eg3d-cube{position:absolute;width:var(--s,120px);height:var(--s,120px);transform-style:preserve-3d;
+  animation:egSpin var(--t,32s) linear infinite;opacity:.85}
+.eg3d-cube-wrap{position:absolute;transform:translate3d(calc(var(--mx,0)*var(--d,40)*1px),calc(var(--my,0)*var(--d,40)*1px),0);transform-style:preserve-3d}
+.eg3d-cube b{position:absolute;inset:0;border:1px solid rgba(180,160,255,.42);background:linear-gradient(135deg,rgba(124,92,255,.10),rgba(255,111,164,.05));box-shadow:inset 0 0 24px rgba(124,92,255,.18)}
+.eg3d-cube b:nth-child(1){transform:rotateY(0) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(2){transform:rotateY(90deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(3){transform:rotateY(180deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(4){transform:rotateY(270deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(5){transform:rotateX(90deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(6){transform:rotateX(-90deg) translateZ(calc(var(--s,120px)/2))}
+@keyframes egSpin{from{transform:rotateX(-24deg) rotateY(0)}to{transform:rotateX(-24deg) rotateY(360deg)}}
+.eg3d-ring{position:absolute;border-radius:50%;border:2px solid rgba(157,133,255,.34);box-shadow:0 0 30px rgba(124,92,255,.25),inset 0 0 30px rgba(124,92,255,.18);
+  transform:rotateX(68deg);animation:egRing var(--t,18s) linear infinite}
+@keyframes egRing{from{transform:rotateX(68deg) rotateZ(0)}to{transform:rotateX(68deg) rotateZ(360deg)}}
+
+.eg3d-card{transform-style:preserve-3d;transition:transform .22s ease,box-shadow .25s ease;will-change:transform;animation:egCardIn .75s cubic-bezier(.2,.8,.2,1) backwards}
+.eg3d-card.eg3d-hot{box-shadow:0 26px 60px rgba(0,0,0,.50),0 0 0 1px rgba(157,133,255,.38),0 0 44px rgba(124,92,255,.22) !important}
+.eg3d-card>h1,.eg3d-card>h2,.eg3d-card>h3{transform:translateZ(26px)}
+@keyframes egCardIn{from{opacity:0;transform:perspective(900px) rotateX(16deg) translateY(36px) scale(.97)}to{opacity:1;transform:perspective(900px) rotateX(0) translateY(0) scale(1)}}
+.eg3d-glare{position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:0;transition:opacity .25s ease;
+  background:radial-gradient(circle at var(--gx,50%) var(--gy,0%),rgba(255,255,255,.17),rgba(255,255,255,0) 52%);z-index:2}
+.eg3d-card.eg3d-hot>.eg3d-glare{opacity:1}
+
+h1{filter:drop-shadow(0 6px 14px rgba(124,92,255,.32))}
+button,.xbtn,input[type=submit],a.btn{transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
+button:not(:disabled):hover,.xbtn:hover,input[type=submit]:hover,a.btn:hover{transform:translateY(-2px);filter:brightness(1.07);box-shadow:0 6px 0 -1px rgba(0,0,0,.38),0 16px 26px rgba(0,0,0,.38)}
+button:not(:disabled):active,.xbtn:active,input[type=submit]:active,a.btn:active{transform:translateY(1px);box-shadow:0 1px 0 rgba(0,0,0,.4)}
+tbody tr{transition:background .2s ease}
+tbody tr:hover{background:rgba(157,133,255,.07)}
+@media (prefers-reduced-motion:reduce){.eg3d-orb>i,.eg3d-cube,.eg3d-ring,.eg3d-card{animation:none !important}}
+</style>
+<script>
+(function(){
+  try{
+    var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var touch = window.matchMedia && matchMedia('(hover: none)').matches;
+    var body = document.body; if(!body || document.getElementById('eg3d-scene')) return;
+
+    // ---- background depth scene ----
+    var scene = document.createElement('div'); scene.id = 'eg3d-scene';
+    function orb(cls,l,t,sz,d,tm){ var o=document.createElement('div'); o.className='eg3d-orb '+cls;
+      o.style.cssText='left:'+l+';top:'+t+';width:'+sz+'px;height:'+sz+'px;--d:'+d+';--t:'+tm+'s'; o.appendChild(document.createElement('i')); scene.appendChild(o); }
+    orb('','6%','14%',150,34,13); orb('pink','82%','10%',110,22,16); orb('blue','90%','62%',190,46,12);
+    orb('','12%','72%',210,50,15); orb('pink','46%','84%',90,18,11); orb('blue','70%','30%',70,14,17);
+    function cube(l,t,s,d,tm){ var w=document.createElement('div'); w.className='eg3d-cube-wrap'; w.style.cssText='left:'+l+';top:'+t+';--d:'+d;
+      var c=document.createElement('div'); c.className='eg3d-cube'; c.style.cssText='--s:'+s+'px;--t:'+tm+'s';
+      for(var i=0;i<6;i++) c.appendChild(document.createElement('b')); w.appendChild(c); scene.appendChild(w); }
+
+    // ---- neon tunnel (canvas, light: half resolution, ~30 fps, pauses when hidden) ----
+    var cv=document.createElement('canvas'); cv.id='eg3d-tunnel';
+    cv.style.cssText='position:absolute;inset:0;width:100%;height:100%;opacity:.9';
+    scene.appendChild(cv);
+    var shade=document.createElement('div');
+    shade.style.cssText='position:absolute;inset:0;background:radial-gradient(ellipse at center,rgba(6,8,22,.55) 0%,rgba(6,8,22,.78) 62%,rgba(4,5,14,.93) 100%)';
+    scene.appendChild(shade);
+    (function(){
+      var ctx=cv.getContext('2d'); if(!ctx) return;
+      var W=0,H=0,t=0,last=0,cx=0,cy=0,tx=0,ty=0,run=true;
+      function size(){ W=cv.width=Math.max(320,Math.floor(window.innerWidth/2)); H=cv.height=Math.max(200,Math.floor(window.innerHeight/2)); }
+      size(); window.addEventListener('resize',size);
+      if(!reduce && !touch) window.addEventListener('pointermove',function(e){ tx=(e.clientX/window.innerWidth-.5)*0.18; ty=(e.clientY/window.innerHeight-.5)*0.18; },{passive:true});
+      document.addEventListener('visibilitychange',function(){ run=!document.hidden; if(run) requestAnimationFrame(frame); });
+      var N=16, SPOKES=12;
+      function frame(ts){
+        if(!run) return;
+        requestAnimationFrame(frame);
+        if(ts-last<33) return; last=ts;
+        var dt=reduce?0:0.011; t+=dt; cx+=(tx-cx)*.06; cy+=(ty-cy)*.06;
+        ctx.fillStyle='#050714'; ctx.fillRect(0,0,W,H);
+        var ox=W/2+cx*W, oy=H/2+cy*H, maxR=Math.hypot(W,H)*.62;
+        ctx.lineCap='round';
+        // spokes
+        ctx.lineWidth=1;
+        for(var s=0;s<SPOKES;s++){
+          var a=s/SPOKES*Math.PI*2+t*.18;
+          ctx.strokeStyle='rgba('+(s%2?'255,60,200':'40,200,255')+',.22)';
+          ctx.beginPath(); ctx.moveTo(ox+Math.cos(a)*maxR*.05,oy+Math.sin(a)*maxR*.05); ctx.lineTo(ox+Math.cos(a)*maxR,oy+Math.sin(a)*maxR); ctx.stroke();
+        }
+        // rings (far to near)
+        for(var i=N;i>=0;i--){
+          var z=(i+(t*3)%1)/N;            // 0 near .. 1 far
+          var p=Math.pow(1-z,2.2);        // perspective
+          var r=maxR*p+4; if(r<3) continue;
+          var alpha=Math.min(1,(1-z)*1.6)*.9;
+          var hue=(i%2)?'255,60,200':'40,200,255';
+          ctx.save(); ctx.translate(ox,oy); ctx.rotate(t*.35*(i%2?1:-1)+i*.12);
+          ctx.lineWidth=Math.max(1,r*.018);
+          ctx.strokeStyle='rgba('+hue+','+alpha.toFixed(3)+')';
+          ctx.shadowColor='rgba('+hue+',.9)'; ctx.shadowBlur=10;
+          ctx.beginPath();
+          if(i%3===0){ // rounded square ring
+            var q=r*.78; ctx.rect(-q,-q,q*2,q*2);
+          } else { ctx.arc(0,0,r,0,Math.PI*2); }
+          ctx.stroke();
+          // pulsing dashes on circles
+          if(i%3===1){ ctx.setLineDash([r*.18,r*.5]); ctx.lineDashOffset=-t*r*2; ctx.lineWidth=Math.max(1.5,r*.03); ctx.beginPath(); ctx.arc(0,0,r*.86,0,Math.PI*2); ctx.stroke(); ctx.setLineDash([]); }
+          ctx.restore();
+        }
+        ctx.shadowBlur=0;
+      }
+      requestAnimationFrame(frame);
+    })();
+    body.insertBefore(scene, body.firstChild);
+
+    // lift normal page content above the scene (keep fixed/absolute things as they are)
+    Array.prototype.forEach.call(body.children, function(el){
+      if (el === scene || /^(SCRIPT|STYLE|LINK)$/.test(el.tagName)) return;
+      var cs = getComputedStyle(el);
+      if (cs.position === 'static') { el.style.position = 'relative'; }
+      if (cs.zIndex === 'auto') { el.style.zIndex = '1'; }
+    });
+
+    // ---- mouse parallax for the scene ----
+    if (!reduce && !touch) {
+      var mx=0,my=0,ticking=false;
+      window.addEventListener('pointermove', function(e){
+        mx=(e.clientX/window.innerWidth-.5)*2; my=(e.clientY/window.innerHeight-.5)*2;
+        if(!ticking){ ticking=true; requestAnimationFrame(function(){ scene.style.setProperty('--mx',mx.toFixed(3)); scene.style.setProperty('--my',my.toFixed(3)); ticking=false; }); }
+      }, {passive:true});
+    }
+
+    // ---- tilting glass cards ----
+    function isCard(el){
+      var r=el.getBoundingClientRect(); if(r.width<200||r.width>1300||r.height<90) return false;
+      if(el.querySelector('video,canvas,iframe,textarea')) return false;
+      var cs=getComputedStyle(el); var br=parseFloat(cs.borderTopLeftRadius)||0; if(br<10) return false;
+      var hasShadow=cs.boxShadow&&cs.boxShadow!=='none'; var hasBorder=parseFloat(cs.borderTopWidth)>0;
+      var bg=cs.backgroundColor; var hasBg=bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent';
+      return hasBg&&(hasShadow||hasBorder);
+    }
+    var cards=[]; var all=document.querySelectorAll('div,section,form,article,main');
+    for(var i=0;i<all.length&&i<600;i++){ var el=all[i]; if(el.closest('#eg3d-scene')||el.closest('.modal-bg')) continue;
+      if(cards.some(function(c){return c.contains(el);})) continue; if(isCard(el)) cards.push(el); }
+    cards.forEach(function(card,idx){
+      card.classList.add('eg3d-card'); card.style.animationDelay=(idx*90)+'ms';
+      if(getComputedStyle(card).position==='static') card.style.position='relative';
+      var g=document.createElement('span'); g.className='eg3d-glare'; card.appendChild(g);
+      if(reduce||touch) return;
+      var raf=0;
+      card.addEventListener('pointermove', function(e){
+        var r=card.getBoundingClientRect(); var px=(e.clientX-r.left)/r.width, py=(e.clientY-r.top)/r.height;
+        var max=r.width>700?2.2:7; var ry=(px-.5)*2*max, rx=-(py-.5)*2*max;
+        if(raf) cancelAnimationFrame(raf);
+        raf=requestAnimationFrame(function(){
+          card.style.setProperty('transform','perspective(900px) rotateX('+rx.toFixed(2)+'deg) rotateY('+ry.toFixed(2)+'deg) translateZ(8px)','important');
+          card.style.setProperty('--gx',(px*100).toFixed(0)+'%'); card.style.setProperty('--gy',(py*100).toFixed(0)+'%');
+          card.classList.add('eg3d-hot');
+        });
+      });
+      card.addEventListener('pointerleave', function(){
+        if(raf) cancelAnimationFrame(raf); card.style.removeProperty('transform'); card.classList.remove('eg3d-hot');
+      });
+    });
+  }catch(err){ if(window.console) console.warn('3D look skipped:', err); }
+})();
+</script>"""
+
+_EG_3D_SKIP_PREFIXES = ("/student/exam", "/admin/live", "/internal", "/admin/recording-stream", "/admin/video", "/admin/voice")
+
+
+@app.after_request
+def eg_3d_effects(response):
+    try:
+        path = request.path or ""
+        if (request.method == "GET" and response.status_code == 200
+                and "text/html" in (response.content_type or "") and not response.is_streamed
+                and not path.startswith(_EG_3D_SKIP_PREFIXES)):
+            body = response.get_data(as_text=True)
+            if "eg-3d-look" in body or "ai-camera-preview" in body:
+                return response
+            if "</body>" in body:
+                body = body.replace("</body>", EG_3D_SNIPPET + "</body>", 1) if body.count("</body>") == 1 else body[:body.rfind("</body>")] + EG_3D_SNIPPET + body[body.rfind("</body>"):]
+            else:
+                body = body + EG_3D_SNIPPET
+            response.set_data(body)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("[UI] 3D look skipped:", exc)
+    return response
+
+
 
 @app.after_request
 def examguard_admin_ui_cleanup(response):
@@ -155,33 +468,47 @@ def _cloudinary_public_id(filename):
     stem = re.sub(r'[^A-Za-z0-9_-]+', '_', stem)[:180] or 'recording'
     return 'examguard/recordings/' + stem
 
-def _cloudinary_recording_url(filename):
-    """Return a URL only when Cloudinary confirms the exact video exists.
+_CLOUD_URL_CACHE = {}
+_CLOUD_URL_LOCK = threading.Lock()
 
-    Never construct a plausible URL from a filename: that made missing uploads
-    appear playable in the admin UI. The public ID includes the stable
-    student+exam filename, so each result row resolves only its own recording.
+
+def _cloudinary_delivery_url(filename, download=False):
+    cloud = os.environ.get('CLOUDINARY_CLOUD_NAME', '').strip()
+    flags = 'fl_attachment/' if download else ''
+    return f"https://res.cloudinary.com/{cloud}/video/upload/{flags}{_cloudinary_public_id(filename)}.webm"
+
+
+def _cloud_mark_present(filename):
+    with _CLOUD_URL_LOCK:
+        _CLOUD_URL_CACHE[os.path.basename(str(filename))] = (time.time() + 3600, True)
+
+
+def _cloudinary_recording_url(filename, download=False):
+    """Playable/downloadable Cloudinary URL, or '' if the video is not there.
+
+    The old version called Cloudinary's Admin API several times per table row,
+    which is slow and quickly hits the API rate limit (so recordings looked
+    "missing" or the page hung). The delivery URL is deterministic from the
+    file name, so a cheap CDN HEAD request (cached) is enough to confirm it.
     """
     if not filename or not _cloudinary_configured():
         return ''
-    try:
-        import cloudinary
-        import cloudinary.api
-        cloudinary.config(
-            cloud_name=os.environ['CLOUDINARY_CLOUD_NAME'].strip(),
-            api_key=os.environ['CLOUDINARY_API_KEY'].strip(),
-            api_secret=os.environ['CLOUDINARY_API_SECRET'].strip(),
-            secure=True,
-        )
-        resource = cloudinary.api.resource(
-            _cloudinary_public_id(filename), resource_type='video',
-        )
-        url = str(resource.get('secure_url') or '').strip()
-        return url if url.startswith('https://') else ''
-    except Exception as exc:
-        # 404 / credentials / network errors all mean: do not show a fake link.
-        print('[CLOUDINARY] Recording existence check failed:', os.path.basename(str(filename)), exc)
-        return ''
+    key = os.path.basename(str(filename))
+    now = time.time()
+    with _CLOUD_URL_LOCK:
+        hit = _CLOUD_URL_CACHE.get(key)
+    if hit and now < hit[0]:
+        exists = hit[1]
+    else:
+        exists = False
+        try:
+            r = requests.head(_cloudinary_delivery_url(key), timeout=(3, 6), allow_redirects=True)
+            exists = (r.status_code == 200)
+        except Exception as exc:
+            print('[CLOUDINARY] existence check failed:', key, exc)
+        with _CLOUD_URL_LOCK:
+            _CLOUD_URL_CACHE[key] = (now + (3600 if exists else 15), exists)
+    return _cloudinary_delivery_url(key, download) if exists else ''
 
 def _upload_recording_to_cloudinary(filepath, filename):
     if not _cloudinary_configured():
@@ -208,6 +535,61 @@ def _upload_recording_to_cloudinary(filepath, filename):
     except Exception as exc:
         print('[CLOUDINARY] Recording upload failed:', exc)
         return False, ''
+
+
+_CLOUD_UPLOADING = set()
+_CLOUD_UPLOADING_LOCK = threading.Lock()
+
+
+def _cloud_upload_async(path, filename):
+    """Upload to Cloudinary in the background so the student's upload request
+    returns immediately. Retries with back-off; a '.cloud' marker records success."""
+    if not _cloudinary_configured() or not os.path.isfile(path):
+        return
+    with _CLOUD_UPLOADING_LOCK:
+        if filename in _CLOUD_UPLOADING:
+            return
+        _CLOUD_UPLOADING.add(filename)
+
+    def worker():
+        try:
+            for attempt in range(1, 8):
+                ok, _url = _upload_recording_to_cloudinary(path, filename)
+                if ok:
+                    _cloud_mark_present(filename)
+                    try:
+                        with open(path + '.cloud', 'w') as fh: fh.write(str(time.time()))
+                    except OSError:
+                        pass
+                    return
+                time.sleep(min(90, 6 * attempt))
+            print('[CLOUDINARY] giving up for now (will retry on next sweep):', filename)
+        finally:
+            with _CLOUD_UPLOADING_LOCK:
+                _CLOUD_UPLOADING.discard(filename)
+    threading.Thread(target=worker, daemon=True, name='cloud-upload').start()
+
+
+def _cloud_sweep_once():
+    try:
+        for name in os.listdir(RECORDINGS_FOLDER):
+            if not name.lower().endswith('.webm') or name.endswith('.partial.webm'):
+                continue
+            p = os.path.join(RECORDINGS_FOLDER, name)
+            if os.path.isfile(p) and not os.path.isfile(p + '.cloud') and os.path.getsize(p) > 1024:
+                _cloud_upload_async(p, name)
+    except Exception as exc:
+        print('[CLOUDINARY] sweep error:', exc)
+
+
+def _start_cloud_sweeper():
+    if not _cloudinary_configured():
+        return
+    def loop():
+        while True:
+            _cloud_sweep_once()
+            time.sleep(300)
+    threading.Thread(target=loop, daemon=True, name='cloud-sweeper').start()
 
 
 # STUDENT -> ADMIN RESULT / RECORDING SYNC
@@ -446,6 +828,500 @@ def save_database(workbook):
             except OSError:
                 pass
         lock.release()
+
+# ============================================================
+# EXAMGUARD SHARED STORE v2  (single source of truth)
+# ------------------------------------------------------------
+# Admin and Student services BOTH read and write the same workbook that
+# lives in Neon (table public.examguard_workbook_store). Before this block the
+# admin service used its own local database.xlsx, which is wiped on every
+# Render restart and is never seen by the student service. That is why new
+# exams never reached students, results never reached teachers, and delete
+# reported "not authorized".
+#
+# Safety rules implemented here:
+#   * Writes are serialised by a Postgres advisory lock.
+#   * If somebody else saved after we loaded, our changes are re-applied on
+#     top of the newest copy (row-level three-way merge) so two students
+#     submitting at the same second never overwrite each other.
+#   * A freshly created blank workbook can NEVER replace existing data.
+#   * `exams_version` changes only when the Exams sheet changes; the student
+#     dashboard polls it to refresh instantly.
+# Without DATABASE_URL (local testing) the original file based behaviour is
+# used unchanged.
+# ============================================================
+import io as _eg_io
+from collections import Counter as _EgCounter
+
+_eg_local_load_database = load_database
+_eg_local_save_database = save_database
+
+_EG_STORE_READY = False
+_EG_STORE_READY_LOCK = threading.Lock()
+_EG_VERSION_CACHE = {"t": 0.0, "v": 1}
+_EG_BLOB_CACHE = {"t": 0.0, "data": None, "ver": 0}
+_EG_BLOB_CACHE_LOCK = threading.Lock()
+_EG_LOCAL_EXAMS_VERSION = {"v": int(time.time())}
+_EG_MERGE_SHEETS_WITH_KEY = {"Results": "Result ID"}
+
+
+def _eg_use_neon():
+    return bool(os.environ.get("DATABASE_URL", "").strip())
+
+
+def _eg_conn():
+    import psycopg
+    return psycopg.connect(os.environ["DATABASE_URL"].strip(), connect_timeout=10)
+
+
+def _eg_ensure_store(conn):
+    global _EG_STORE_READY
+    if _EG_STORE_READY:
+        return
+    with _EG_STORE_READY_LOCK:
+        if _EG_STORE_READY:
+            return
+        last = None
+        for _ in range(3):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.examguard_workbook_store (
+                            store_id INTEGER PRIMARY KEY CHECK (store_id = 1),
+                            workbook_bytes BYTEA NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )""")
+                    cur.execute("ALTER TABLE public.examguard_workbook_store "
+                                "ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1")
+                    cur.execute("ALTER TABLE public.examguard_workbook_store "
+                                "ADD COLUMN IF NOT EXISTS exams_version BIGINT NOT NULL DEFAULT 1")
+                conn.commit()
+                _EG_STORE_READY = True
+                return
+            except Exception as exc:       # two services creating it at once
+                last = exc
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+        raise last
+
+
+def _eg_norm_rows(ws):
+    rows = []
+    for r in ws.iter_rows(values_only=True):
+        t = tuple(r)
+        end = len(t)
+        while end > 0 and t[end - 1] is None:
+            end -= 1
+        rows.append(t[:end])
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
+def _eg_fetch(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT workbook_bytes, version FROM public.examguard_workbook_store WHERE store_id=1")
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None, 0
+    return bytes(row[0]), int(row[1] or 1)
+
+
+def _eg_seed_from_local(conn):
+    """Seed Neon once from a local workbook (first ever deploy only)."""
+    try:
+        if _valid_xlsx(DATABASE):
+            with open(DATABASE, "rb") as fh:
+                data = fh.read()
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, version, exams_version) "
+                            "VALUES (1, %s, 1, 1) ON CONFLICT (store_id) DO NOTHING", (data,))
+            conn.commit()
+            print("[STORE] Seeded shared workbook from local database.xlsx")
+    except Exception as exc:
+        print("[STORE] Seed skipped:", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _eg_get_blob(fresh=True):
+    """Return (bytes, version) of the shared workbook."""
+    if not fresh:
+        with _EG_BLOB_CACHE_LOCK:
+            if _EG_BLOB_CACHE["data"] is not None and time.time() - _EG_BLOB_CACHE["t"] < 1.5:
+                return _EG_BLOB_CACHE["data"], _EG_BLOB_CACHE["ver"]
+    last = None
+    for attempt in range(4):
+        conn = None
+        try:
+            conn = _eg_conn()
+            _eg_ensure_store(conn)
+            data, ver = _eg_fetch(conn)
+            if data is None:
+                _eg_seed_from_local(conn)
+                data, ver = _eg_fetch(conn)
+            if data is None:
+                return None, 0
+            with _EG_BLOB_CACHE_LOCK:
+                _EG_BLOB_CACHE.update({"t": time.time(), "data": data, "ver": ver})
+            return data, ver
+        except Exception as exc:
+            last = exc
+            time.sleep(0.25 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Shared database is unreachable: {last}")
+
+
+def load_database(*args, **kwargs):
+    if not _eg_use_neon():
+        return _eg_local_load_database(*args, **kwargs)
+    read_only = bool(kwargs.get("read_only"))
+    data, ver = _eg_get_blob(fresh=not read_only)
+    if data is None:
+        # Brand new Neon database and no local file: create the blank schema once.
+        try:
+            initialize_database()
+        except Exception as exc:
+            print("[STORE] initialize_database failed:", exc)
+        data, ver = _eg_get_blob(fresh=True)
+        if data is None:
+            raise RuntimeError("Shared workbook could not be created")
+    wb = load_workbook(_eg_io.BytesIO(data), *args, **kwargs)
+    if not read_only:
+        wb._eg_base_version = ver
+        wb._eg_base = {ws.title: _eg_norm_rows(ws) for ws in wb.worksheets}
+    return wb
+
+
+def _eg_merge_rows(name, base_rows, mine_rows, theirs_rows):
+    """Re-apply my row additions/removals on top of the newest rows."""
+    if base_rows == theirs_rows:
+        return list(mine_rows)
+    b_head = base_rows[0] if base_rows else ()
+    m_head = mine_rows[0] if mine_rows else ()
+    t_head = theirs_rows[0] if theirs_rows else ()
+    if m_head != b_head:
+        head = m_head if len(m_head) >= len(t_head) else t_head
+    else:
+        head = t_head or m_head
+    base_body, mine_body, theirs_body = base_rows[1:], mine_rows[1:], theirs_rows[1:]
+    added = _EgCounter(mine_body) - _EgCounter(base_body)
+    removed = _EgCounter(base_body) - _EgCounter(mine_body)
+    body = []
+    for row in theirs_body:
+        if removed.get(row, 0) > 0:
+            removed[row] -= 1
+            continue
+        body.append(row)
+    for row in mine_body:
+        if added.get(row, 0) > 0:
+            added[row] -= 1
+            body.append(row)
+    key_col = _EG_MERGE_SHEETS_WITH_KEY.get(name)
+    if key_col and head and key_col in head:
+        ki = head.index(key_col)
+        rec_i = head.index("Recording File") if "Recording File" in head else None
+        seen, out = {}, []
+        for row in body:
+            key = row[ki] if ki < len(row) else None
+            if key in (None, ""):
+                out.append(row)
+                continue
+            if key in seen:
+                prev = out[seen[key]]
+                if rec_i is not None and (len(row) <= rec_i or not row[rec_i]) and len(prev) > rec_i and prev[rec_i]:
+                    row = tuple(list(row) + [None] * (rec_i + 1 - len(row)))
+                    row = row[:rec_i] + (prev[rec_i],) + row[rec_i + 1:]
+                out[seen[key]] = row
+            else:
+                seen[key] = len(out)
+                out.append(row)
+        body = out
+    return [head] + body if (head or body) else []
+
+
+def _eg_merge_bytes(changed, base, latest_bytes):
+    latest = load_workbook(_eg_io.BytesIO(latest_bytes))
+    for name, mine_rows in changed.items():
+        if name in latest.sheetnames:
+            ws = latest[name]
+            theirs_rows = _eg_norm_rows(ws)
+        else:
+            ws = latest.create_sheet(name)
+            theirs_rows = []
+        merged = _eg_merge_rows(name, base.get(name, []), mine_rows, theirs_rows)
+        if ws.max_row and ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+        for row in merged:
+            ws.append(list(row))
+    out = _eg_io.BytesIO()
+    latest.save(out)
+    latest.close()
+    return out.getvalue()
+
+
+def save_database(workbook):
+    if not _eg_use_neon():
+        return _eg_local_save_database(workbook)
+    base = getattr(workbook, "_eg_base", None)
+    base_ver = getattr(workbook, "_eg_base_version", None)
+    changed = {}
+    for ws in workbook.worksheets:
+        rows = _eg_norm_rows(ws)
+        if base is None or base.get(ws.title) != rows:
+            changed[ws.title] = rows
+    mine = _eg_io.BytesIO()
+    workbook.save(mine)
+    mine_bytes = mine.getvalue()
+    exams_touched = int(("Exams" in changed) or ("ArchivedExams" in changed))
+    last = None
+    for attempt in range(4):
+        conn = None
+        try:
+            conn = _eg_conn()
+            _eg_ensure_store(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(741209, 1)")
+                cur.execute("SELECT workbook_bytes, version FROM public.examguard_workbook_store "
+                            "WHERE store_id=1 FOR UPDATE")
+                row = cur.fetchone()
+                if row is None or row[0] is None:
+                    cur.execute("INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, version, exams_version) "
+                                "VALUES (1, %s, 1, 1) ON CONFLICT (store_id) DO UPDATE SET "
+                                "workbook_bytes=EXCLUDED.workbook_bytes, updated_at=NOW()", (mine_bytes,))
+                else:
+                    cur_ver = int(row[1] or 1)
+                    if base is None:
+                        # A workbook that was not loaded from the store (for
+                        # example a blank one created at start-up) must never
+                        # replace existing data.
+                        conn.rollback()
+                        print("[STORE] Ignored a blank-workbook save; shared data already exists")
+                        return True
+                    out_bytes = mine_bytes
+                    if base_ver is not None and cur_ver != base_ver and changed:
+                        out_bytes = _eg_merge_bytes(changed, base, bytes(row[0]))
+                    elif not changed:
+                        conn.rollback()
+                        return True
+                    cur.execute("UPDATE public.examguard_workbook_store SET workbook_bytes=%s, "
+                                "version=version+1, exams_version=exams_version+%s, updated_at=NOW() "
+                                "WHERE store_id=1", (out_bytes, exams_touched))
+            conn.commit()
+            with _EG_BLOB_CACHE_LOCK:
+                _EG_BLOB_CACHE["data"] = None
+            _EG_VERSION_CACHE["t"] = 0.0
+            return True
+        except Exception as exc:
+            last = exc
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            time.sleep(0.3 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Shared database write failed: {last}")
+
+
+def eg_exams_version():
+    """Cheap counter that changes whenever the Exams sheet changes."""
+    if not _eg_use_neon():
+        return _EG_LOCAL_EXAMS_VERSION["v"]
+    now = time.time()
+    if now - _EG_VERSION_CACHE["t"] < 0.5:
+        return _EG_VERSION_CACHE["v"]
+    conn = None
+    try:
+        conn = _eg_conn()
+        _eg_ensure_store(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT exams_version FROM public.examguard_workbook_store WHERE store_id=1")
+            row = cur.fetchone()
+        if row:
+            _EG_VERSION_CACHE["v"] = int(row[0] or 1)
+        _EG_VERSION_CACHE["t"] = now
+    except Exception as exc:
+        print("[STORE] exams_version read failed:", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return _EG_VERSION_CACHE["v"]
+
+
+
+# ============================================================
+# EXAM CHANGE NOTIFICATION + SOFT DELETE
+# ============================================================
+# Shared Neon mode: both services already see the same workbook and the
+# student dashboard notices the new `exams_version` within a second.
+# Local mode (no DATABASE_URL, e.g. two PCs on one Wi-Fi): this admin pushes
+# the Exams sheet straight to the student service every time it changes.
+USE_PUBLIC_EXAMS_TABLE = False   # the old public.exams mirror is superseded
+
+import hashlib as _eg_hashlib
+_EXAM_PUSH_EVENT = threading.Event()
+_EXAM_PUSH_STATE = {"hash": "", "started": False}
+_EXAM_PUSH_LOCK = threading.Lock()
+
+
+def _exam_rows_for_push():
+    wb = load_database(read_only=True, data_only=True)
+    try:
+        if "Exams" not in wb.sheetnames:
+            return []
+        rows = []
+        for row in wb["Exams"].iter_rows(min_row=2, values_only=True):
+            if not row or row[0] in (None, ""):
+                continue
+            rows.append([
+                (v.strftime("%Y-%m-%dT%H:%M") if hasattr(v, "strftime") else v)
+                for v in row[:15]
+            ])
+        return rows
+    finally:
+        wb.close()
+
+
+def _push_exams_to_student_once(force=False):
+    """Local mode only. Returns True when the student service is up to date."""
+    if _eg_use_neon():
+        return True
+    rows = _exam_rows_for_push()
+    digest = _eg_hashlib.sha1(json.dumps(rows, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    if not force and digest == _EXAM_PUSH_STATE["hash"]:
+        return True
+    r = requests.post(
+        f"{STUDENT_SIGNAL_BASE_URL}/internal/sync/exams",
+        json={"rows": rows},
+        headers={"X-ExamGuard-Sync-Token": RECORDING_SYNC_TOKEN},
+        timeout=(4, 20),
+        verify=STUDENT_SIGNAL_VERIFY_SSL,
+    )
+    ok = bool(r.ok and (r.json() if r.content else {}).get("success"))
+    if ok:
+        _EXAM_PUSH_STATE["hash"] = digest
+        print(f"[EXAM-SYNC] Student service updated ({len(rows)} exam rows)")
+    else:
+        print("[EXAM-SYNC] Student service rejected the exam list:", r.status_code)
+    return ok
+
+
+def _exam_push_loop():
+    failed = True
+    while True:
+        triggered = _EXAM_PUSH_EVENT.wait(timeout=3 if failed else 20)
+        _EXAM_PUSH_EVENT.clear()
+        try:
+            failed = not _push_exams_to_student_once(force=bool(triggered) or failed)
+        except Exception as exc:
+            failed = True
+            print("[EXAM-SYNC] Student not reachable yet:", exc)
+            time.sleep(2)
+
+
+def _start_exam_push_thread():
+    if _eg_use_neon():
+        return
+    with _EXAM_PUSH_LOCK:
+        if _EXAM_PUSH_STATE["started"]:
+            return
+        _EXAM_PUSH_STATE["started"] = True
+    threading.Thread(target=_exam_push_loop, daemon=True, name="exam-push").start()
+
+
+
+def _migrate_public_exams_once():
+    """One time: bring exams that only exist in the old public.exams mirror
+    (created from the admin site before the databases were unified) into the
+    shared workbook, so students can finally see them."""
+    if not _eg_use_neon():
+        return
+    wb = load_database()
+    try:
+        if "Meta" in wb.sheetnames and any(
+                r and r[0] == "public_exams_migrated" for r in wb["Meta"].iter_rows(values_only=True)):
+            return
+        rows = []
+        conn = None
+        try:
+            conn = _eg_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM public.exams")
+                rows = cur.fetchall()
+        except Exception:
+            rows = []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        have = {str(r[0]).strip() for r in wb["Exams"].iter_rows(min_row=2, values_only=True) if r and r[0]}
+        archived = set()
+        if "ArchivedExams" in wb.sheetnames:
+            archived = {str(r[0]).strip() for r in wb["ArchivedExams"].iter_rows(min_row=2, values_only=True) if r and r[0]}
+        added = 0
+        for row in rows:
+            if len(row) < 15:
+                continue
+            exam_id = str(row[0]).strip()
+            if not exam_id or exam_id in have or exam_id in archived:
+                continue
+            vals = list(row[:15])
+            for idx in (5, 14):
+                try:
+                    vals[idx] = int(str(vals[idx]).strip())
+                except (TypeError, ValueError):
+                    pass
+            wb["Exams"].append(vals)
+            added += 1
+        meta = wb["Meta"] if "Meta" in wb.sheetnames else wb.create_sheet("Meta")
+        meta.append(["public_exams_migrated", datetime.now().isoformat(), added])
+        save_database(wb)
+        print(f"[MIGRATE] Imported {added} exam row(s) from the old public.exams mirror")
+    finally:
+        wb.close()
+
+
+def notify_exams_changed():
+    """Call after any exam was created, edited or removed."""
+    _EG_VERSION_CACHE["t"] = 0.0
+    if not _eg_use_neon():
+        _start_exam_push_thread()
+        _EXAM_PUSH_EVENT.set()
+
+
+def _archive_exam_rows(workbook, rows, who):
+    """Keep a permanent copy of removed exam rows in the ArchivedExams sheet."""
+    if "ArchivedExams" not in workbook.sheetnames:
+        ws = workbook.create_sheet("ArchivedExams")
+        header = [c.value for c in workbook["Exams"][1]]
+        ws.append(header + ["Archived At", "Archived By"])
+    else:
+        ws = workbook["ArchivedExams"]
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        ws.append(list(row) + [stamp, who])
+
 
 FIXED_SUBJECTS = [
     'Default (Manual Questions)',
@@ -956,14 +1832,7 @@ def index():
     </head>
     <body>
       <div style="max-width:640px;margin:80px auto;padding:0 20px;font-family:'Segoe UI',Arial,sans-serif;">
-        <div style="font:600 11.5px monospace;letter-spacing:.08em;text-transform:uppercase;color:#9d85ff;margin-bottom:10px;">
-          Management System
-        </div>
-        <h1 style="font-size:32px;margin:0 0 10px;color:#f1f0f7;background:linear-gradient(120deg,#f1f0f7 40%,#9d85ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">Exam Management System</h1>
-        <p style="color:#b7b3cc;font-size:15px;margin-bottom:36px;">
-          This system is separate from the student exam portal. Only teachers and
-          administrators can access this system.
-        </p>
+        <h1 style="font-size:32px;margin:0 0 36px;color:#f1f0f7;background:linear-gradient(120deg,#f1f0f7 40%,#9d85ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">Exam Management System</h1>
 
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
           <div class="ai-role-card" style="background:rgba(20,24,42,0.62);border:1px solid rgba(157,133,255,0.28);border-radius:14px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,0.35);backdrop-filter:blur(12px);transition:transform .25s ease, box-shadow .25s ease;">
@@ -1125,9 +1994,8 @@ def dashboard():
     teacher_id = session["teacher_id"]
     exams = {}
 
-    # On Render, use the same shared Neon database as the Student service.
-    # This prevents the dashboard from showing stale rows from database.xlsx.
-    if os.environ.get("DATABASE_URL", "").strip():
+    # Single source of truth: the shared workbook (Neon on Render).
+    if USE_PUBLIC_EXAMS_TABLE and os.environ.get("DATABASE_URL", "").strip():
         conn = None
         try:
             conn = _shared_db_connection()
@@ -1392,22 +2260,7 @@ def create_exam():
         save_database(workbook)
         workbook.close()
 
-        if os.environ.get("DATABASE_URL", "").strip():
-            try:
-                _shared_exam_rows_from_excel([
-                    [exam_id, teacher_id, teacher_name, subject_name, subject_code,
-                     number, q["question"], q["option_a"], q["option_b"], q["option_c"],
-                     q["option_d"], q["correct_answer"], available_from, available_until,
-                     duration_minutes]
-                    for number, q in enumerate(questions, start=1)
-                ])
-            except Exception as sync_error:
-                app.logger.exception("Neon exam sync failed")
-                flash(
-                    f"Exam saved in the local workbook, but shared database sync failed: {sync_error}",
-                    "error"
-                )
-                return redirect(url_for("dashboard"))
+        notify_exams_changed()   # students see the new exam within a second
 
         flash(
             f"Exam created successfully. Exam ID: {exam_id}",
@@ -1456,8 +2309,8 @@ def manage_exams():
     teacher_id = session["teacher_id"]
     exams = {}
 
-    # Match the Student service's shared Neon data on Render.
-    if os.environ.get("DATABASE_URL", "").strip():
+    # Single source of truth: the shared workbook (Neon on Render).
+    if USE_PUBLIC_EXAMS_TABLE and os.environ.get("DATABASE_URL", "").strip():
         conn = None
         try:
             conn = _shared_db_connection()
@@ -1512,50 +2365,51 @@ def manage_exams():
 @app.route("/teacher/exam/<exam_id>/delete", methods=["POST"])
 @teacher_login_required
 def delete_exam(exam_id):
-    """Delete one teacher-owned exam and its question rows.
+    """Remove an exam from the dashboards.
 
-    Exams with recorded student results are intentionally protected so deleting
-    the question set cannot silently destroy or invalidate historical results.
+    The exam is never destroyed: its question rows move to the ArchivedExams
+    sheet, and every result / recording that exists stays exactly where it is.
+    Having results or recordings does NOT block removal.
     """
-    teacher_id = session["teacher_id"]
+    teacher_id = str(session.get("teacher_id", "")).strip()
+    wanted = str(exam_id).strip()
     workbook = load_database()
-    exam_sheet = workbook["Exams"]
+    try:
+        exam_sheet = workbook["Exams"]
+        row_numbers, removed_rows, other_owner = [], [], False
+        for excel_row, row in enumerate(exam_sheet.iter_rows(min_row=2, values_only=True), start=2):
+            if str(row[0] if row else "").strip() != wanted:
+                continue
+            if str(row[1] or "").strip() == teacher_id:
+                row_numbers.append(excel_row)
+                removed_rows.append(row)
+            else:
+                other_owner = True
 
-    row_numbers = []
-    for excel_row, row in enumerate(exam_sheet.iter_rows(min_row=2, values_only=True), start=2):
-        if row[0] == exam_id and row[1] == teacher_id:
-            row_numbers.append(excel_row)
-
-    if not row_numbers:
-        workbook.close()
-        flash("Exam not found or you are not authorized to remove it.", "error")
-        return redirect(url_for("manage_exams"))
-
-    if "Results" in workbook.sheetnames:
-        results_sheet = workbook["Results"]
-        has_results = any(
-            r[3] == exam_id
-            for r in results_sheet.iter_rows(min_row=2, values_only=True)
-            if len(r) > 3
-        )
-        if has_results:
+        if not row_numbers:
             workbook.close()
-            flash("This exam has student results, so it cannot be removed.", "error")
+            if other_owner:
+                flash("You can only remove exams that you created.", "error")
+            else:
+                flash("This exam was already removed.", "success")
             return redirect(url_for("manage_exams"))
 
-    for excel_row in reversed(row_numbers):
-        exam_sheet.delete_rows(excel_row, 1)
-
-    save_database(workbook)
-    workbook.close()
-    if os.environ.get("DATABASE_URL", "").strip():
+        _archive_exam_rows(workbook, removed_rows, teacher_id)
+        for excel_row in reversed(row_numbers):
+            exam_sheet.delete_rows(excel_row, 1)
+        save_database(workbook)
+    except Exception as exc:
+        app.logger.exception("Exam removal failed")
+        flash(f"Could not remove the exam: {exc}", "error")
+        return redirect(url_for("manage_exams"))
+    finally:
         try:
-            _shared_delete_exam(exam_id)
+            workbook.close()
         except Exception:
-            app.logger.exception("Neon exam delete sync failed")
-            flash("Exam was removed from the local workbook, but shared database sync failed.", "error")
-            return redirect(url_for("manage_exams"))
-    flash(f"Exam {exam_id} removed successfully.", "success")
+            pass
+
+    notify_exams_changed()
+    flash(f"Exam {exam_id} removed. Its results and recordings are still stored safely.", "success")
     return redirect(url_for("manage_exams"))
 
 
@@ -1569,7 +2423,7 @@ def edit_exam(exam_id):
     rows = []
     row_numbers = []
     for excel_row, row in enumerate(exam_sheet.iter_rows(min_row=2, values_only=True), start=2):
-        if row[0] == exam_id and row[1] == teacher_id:
+        if str(row[0] or "").strip() == str(exam_id).strip() and str(row[1] or "").strip() == str(teacher_id).strip():
             row_numbers.append(excel_row)
             rows.append(row)
 
@@ -1642,18 +2496,7 @@ def edit_exam(exam_id):
 
         save_database(workbook)
         workbook.close()
-        if os.environ.get("DATABASE_URL", "").strip():
-            try:
-                _shared_exam_rows_from_excel([
-                    [exam_id, teacher_id, teacher_name, subject_name, subject_code,
-                     number, q, oa, ob, oc, od, correct, available_from,
-                     available_until, duration_minutes]
-                    for number, (q, oa, ob, oc, od, correct) in enumerate(questions, start=1)
-                ])
-            except Exception:
-                app.logger.exception("Neon exam edit sync failed")
-                flash("Exam updated in the local workbook, but shared database sync failed.", "error")
-                return redirect(url_for("dashboard"))
+        notify_exams_changed()   # students see the change within a second
         flash(f"Exam {exam_id} updated successfully.", "success")
         return redirect(url_for("dashboard"))
 
@@ -1941,9 +2784,8 @@ def internal_sync_recording():
         if os.path.getsize(temp)<1024 or magic!=bytes((0x1a,0x45,0xdf,0xa3)):
             os.remove(temp); temp=None; return jsonify({"success":False,"error":"Invalid WebM recording"}),400
         os.replace(temp,target); temp=None
-        cloud_ok, cloud_url = _upload_recording_to_cloudinary(target, fn)
-        if _cloudinary_configured() and not cloud_ok:
-            return jsonify({"success":False,"error":"Recording saved locally but Cloudinary upload failed; retry required"}),503
+        cloud_url = ""
+        _cloud_upload_async(target, fn)   # background; the student is not kept waiting
 
         # If the result arrived before the recording, attach the confirmed
         # filename now so the admin recordings/results screens do not retain
@@ -1980,7 +2822,7 @@ def internal_sync_recording():
             except Exception: pass
 
         print(f"[SYNC] Recording received and linked: {fn} ({student_id}/{exam_id})")
-        return jsonify({"success":True,"filename":fn,"size":os.path.getsize(target),"durable":bool(cloud_url),"recording_url":cloud_url})
+        return jsonify({"success":True,"filename":fn,"size":os.path.getsize(target),"durable":False,"cloud_pending":_cloudinary_configured(),"recording_url":""})
     except Exception as e:
         if temp:
             try: os.remove(temp)
@@ -1994,6 +2836,24 @@ def internal_sync_result():
     try:
         payload=request.get_json(silent=True) or {}
         wb=load_database()
+        if _eg_use_neon():
+            # Student and admin share one database: the result is already
+            # there. Only the recording file name may still need attaching.
+            _rid = str(payload.get("result_id", "")).strip()
+            _ws = wb["Results"] if "Results" in wb.sheetnames else None
+            if _ws is not None and _rid:
+                _hdr = [c.value for c in _ws[1]]
+                if "Result ID" in _hdr:
+                    _rc = _hdr.index("Result ID")
+                    _fc = _hdr.index("Recording File") if "Recording File" in _hdr else None
+                    _want = _safe_sync_filename(payload.get("recording_file")) if payload.get("recording_file") else ""
+                    for _r in _ws.iter_rows(min_row=2, values_only=True):
+                        if len(_r) > _rc and str(_r[_rc] or "") == _rid:
+                            _have = str(_r[_fc] or "") if (_fc is not None and len(_r) > _fc) else ""
+                            if not _want or _have == _want:
+                                wb.close()
+                                return jsonify({"success": True, "result_id": _rid, "shared": True})
+                            break
         _upsert_admin_sync_result(wb,payload)
         # If the video arrived first, attach it while inserting/upserting the result.
         recording_name = str(payload.get("recording_file", "") or "").strip()
@@ -2023,6 +2883,41 @@ def internal_sync_result():
         except Exception: pass
         return jsonify({"success":False,"error":str(e)}),500
 
+_REC_TOKEN_LOCKS = {}
+_REC_TOKEN_LOCKS_GUARD = threading.Lock()
+
+
+class _RecTokenLock:
+    """Serialise chunk assembly for one recording (threads and, on Linux, processes)."""
+    def __init__(self, token):
+        with _REC_TOKEN_LOCKS_GUARD:
+            self.tl = _REC_TOKEN_LOCKS.setdefault(token, threading.Lock())
+        self.token = token
+        self.fh = None
+
+    def __enter__(self):
+        self.tl.acquire()
+        try:
+            import fcntl
+            os.makedirs(RECORDING_PARTS_FOLDER, exist_ok=True)
+            self.fh = open(os.path.join(RECORDING_PARTS_FOLDER, f".{self.token}.lock"), "a+")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except Exception:
+            self.fh = None
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.fh is not None:
+                import fcntl
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+                self.fh.close()
+        except Exception:
+            pass
+        self.tl.release()
+        return False
+
+
 @app.route("/internal/sync/recording-chunk", methods=["POST"])
 def internal_sync_recording_chunk():
     if not _sync_token_valid(request.headers.get("X-ExamGuard-Sync-Token", "")):
@@ -2039,10 +2934,18 @@ def internal_sync_recording_chunk():
         seq = int(seq_raw)
         if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", token) or seq < 0 or seq > 1000000:
             return jsonify({"success": False, "error": "Invalid recording chunk metadata"}), 400
+        with _RecTokenLock(token):
+            return _store_recording_chunk(exam_id, student_id, filename, token, seq, chunk)
+    except Exception as e:
+        print("[SYNC] recording chunk error:", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _store_recording_chunk(exam_id, student_id, filename, token, seq, chunk):
+    try:
         token_dir = os.path.join(RECORDING_PARTS_FOLDER, token)
         os.makedirs(token_dir, exist_ok=True)
         meta_path = os.path.join(token_dir, "meta.json")
-        safe_student = re.sub(r"[^A-Za-z0-9._-]+", "_", student_id)[:100] or "student"
         if os.path.exists(meta_path):
             try:
                 meta = json.loads(open(meta_path, "r", encoding="utf-8").read())
@@ -2089,8 +2992,12 @@ def internal_sync_recording_chunk():
 
 @app.route("/internal/sync/recording-finalize", methods=["POST"])
 def internal_sync_recording_finalize():
+    """Assemble chunk-synced recordings (the student normally sends one complete
+    file via /internal/sync/recording; this path is the chunked alternative)."""
     if not _sync_token_valid(request.headers.get("X-ExamGuard-Sync-Token", "")):
         return jsonify({"success": False, "error": "Unauthorized recording sync"}), 401
+    partial = None
+    _lk = None
     try:
         exam_id = str(request.form.get("exam_id", "")).strip()
         student_id = str(request.form.get("student_id", "")).strip()
@@ -2100,67 +3007,68 @@ def internal_sync_recording_finalize():
         expected = int(expected_raw) if expected_raw.isdigit() else None
         if not exam_id or not student_id or not token:
             return jsonify({"success": False, "error": "Missing recording finalize data"}), 400
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", token):
+            return jsonify({"success": False, "error": "Invalid token"}), 400
+        _lk = _RecTokenLock(token)
+        _lk.__enter__()
         token_dir = os.path.join(RECORDING_PARTS_FOLDER, token)
         meta_path = os.path.join(token_dir, "meta.json")
+        done_target = os.path.join(RECORDINGS_FOLDER, filename)
+        if (not os.path.isdir(token_dir)) and os.path.isfile(done_target) and os.path.getsize(done_target) > 1024:
+            return jsonify({"success": True, "filename": filename, "already": True})
         if not os.path.isdir(token_dir) or not os.path.isfile(meta_path):
             return jsonify({"success": False, "error": "Recording chunks not found", "retry": True}), 409
-        meta = json.loads(open(meta_path, "r", encoding="utf-8").read())
+        with open(meta_path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
         if str(meta.get("student_id", "")) != student_id or str(meta.get("exam_id", "")) != exam_id:
             return jsonify({"success": False, "error": "Recording metadata mismatch"}), 403
+
         target = os.path.join(RECORDINGS_FOLDER, filename)
         partial = target + ".uploading"
         progressive = target + ".partial.webm"
+
+        # The chunk endpoint appends contiguous parts to the progressive file
+        # and deletes them, remembering how far it got in assembled_seq.txt.
+        seq_marker = os.path.join(token_dir, "assembled_seq.txt")
         next_seq = 0
+        if os.path.isfile(seq_marker):
+            try: next_seq = int(Path(seq_marker).read_text(encoding="utf-8").strip() or "0")
+            except Exception: next_seq = 0
         while os.path.isfile(os.path.join(token_dir, f"{next_seq:08d}.part")):
+            with open(progressive, "ab") as out_file, open(os.path.join(token_dir, f"{next_seq:08d}.part"), "rb") as src:
+                shutil.copyfileobj(src, out_file, length=1024 * 1024)
+            try: os.remove(os.path.join(token_dir, f"{next_seq:08d}.part"))
+            except OSError: pass
             next_seq += 1
+        try: Path(seq_marker).write_text(str(next_seq), encoding="utf-8")
+        except Exception: pass
+
         if expected is not None and next_seq <= expected:
             return jsonify({"success": False, "retry": True, "next_seq": next_seq,
-                            "missing_sequences": list(range(next_seq, min(expected + 1, next_seq + 80))) }), 409
-        if next_seq == 0:
+                            "missing_sequences": list(range(next_seq, min(expected + 1, next_seq + 80)))}), 409
+        if not os.path.isfile(progressive) or os.path.getsize(progressive) < 1024:
             return jsonify({"success": False, "error": "Recording is empty", "retry": True}), 409
-        if os.path.isfile(progressive) and os.path.getsize(progressive) >= 1024:
-            shutil.copy2(progressive, partial)
-        else:
-            with open(partial, "wb") as out_file:
-                for seq in range(next_seq):
-                    part = os.path.join(token_dir, f"{seq:08d}.part")
-                    if not os.path.isfile(part):
-                        return jsonify({"success": False, "retry": True, "missing_sequences": [seq]}), 409
-                    with open(part, "rb") as src_file:
-                        shutil.copyfileobj(src_file, out_file, length=1024 * 1024)
-        if os.path.getsize(partial) < 1024:
-            try: os.remove(partial)
-            except OSError: pass
-            return jsonify({"success": False, "error": "Recording file too small", "retry": True}), 409
-        with open(partial, "rb") as fh:
+        with open(progressive, "rb") as fh:
             magic = fh.read(4)
         if magic != bytes((0x1a, 0x45, 0xdf, 0xa3)):
-            try: os.remove(partial)
-            except OSError: pass
             return jsonify({"success": False, "error": "Recording is not a valid WebM"}), 400
-        if not os.path.isfile(target):
-            os.replace(partial, target)
-        else:
-            try: os.remove(partial)
-            except OSError: pass
-        cloud_ok, cloud_url = _upload_recording_to_cloudinary(target, filename)
-        if _cloudinary_configured() and not cloud_ok:
-            # Keep local validated copy and report failure so student does not unlock
-            # while durable cloud storage has not confirmed receipt. A retry can finalize again.
-            return jsonify({"success": False, "error": "Recording assembled but Cloudinary upload failed; retry finalize", "retry": True}), 503
-        try:
-            if os.path.isfile(progressive): os.remove(progressive)
-        except OSError: pass
+
+        os.replace(progressive, target)
+        partial = None
         shutil.rmtree(token_dir, ignore_errors=True)
-        print(f"[SYNC] Recording finalized on admin: {filename} ({student_id}/{exam_id}); cloudinary={bool(cloud_url)}")
-        return jsonify({"success": True, "filename": filename, "size": os.path.getsize(target), "durable": bool(cloud_url), "recording_url": cloud_url})
+        _cloud_upload_async(target, filename)
+        print(f"[SYNC] Recording finalized on admin: {filename} ({student_id}/{exam_id})")
+        return jsonify({"success": True, "filename": filename, "size": os.path.getsize(target), "durable": False})
     except Exception as e:
         print("[SYNC] recording finalize error:", e)
         try:
-            if os.path.isfile(partial): os.remove(partial)
+            if partial and os.path.isfile(partial): os.remove(partial)
         except Exception:
             pass
         return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if _lk is not None:
+            _lk.__exit__(None, None, None)
 
 
 @app.route("/internal/sync/live-heartbeat", methods=["POST"])
@@ -2168,6 +3076,7 @@ def internal_sync_live_heartbeat():
     token = str(request.headers.get("X-ExamGuard-Live-Token", "")).strip()
     if not LIVE_SYNC_TOKEN or token != LIVE_SYNC_TOKEN:
         return jsonify({"success":False,"error":"Unauthorized live heartbeat"}),401
+    tmp=None
     try:
         student_id=str(request.form.get("student_id","")).strip()
         if not student_id:
@@ -2198,15 +3107,19 @@ def internal_sync_live_heartbeat():
             # measurement — no cross-machine skew possible.
             "last_seen":time.time(),
             "student_signal_base_url":str(request.form.get("student_signal_base_url", "")).strip(),
+            "status":str(request.form.get("status","")),
+            "warning":str(request.form.get("warning","false")).lower() in ("1","true","yes","on"),
+            "warning_message":str(request.form.get("warning_message","")),
+            **_live_form_extras(),
         }
         tmp=os.path.join(LIVE_FRAMES_FOLDER,f"{safe_id}.json.uploading")
         with open(tmp,"w",encoding="utf-8") as fh: json.dump(status,fh)
         os.replace(tmp,os.path.join(LIVE_FRAMES_FOLDER,f"{safe_id}.json"))
-        print(f"[LIVE] heartbeat received: {student_id} / {status["exam_id"]}")
+        print(f"[LIVE] heartbeat received: {student_id} / {status['exam_id']}")
         return jsonify({"success":True})
     except Exception as e:
         try:
-            if os.path.exists(tmp): os.remove(tmp)
+            if tmp and os.path.exists(tmp): os.remove(tmp)
         except Exception: pass
         return jsonify({"success":False,"error":str(e)}),500
 
@@ -2242,11 +3155,12 @@ def internal_sync_live_frame():
             "warning":str(request.form.get("warning","false")).lower() in ("1","true","yes","on"),
             "warning_message":str(request.form.get("warning_message","")),
             "student_signal_base_url":str(request.form.get("student_signal_base_url", "")).strip(),
+            **_live_form_extras(),
         }
         status_tmp=os.path.join(LIVE_FRAMES_FOLDER,f"{safe_id}.json.uploading")
         with open(status_tmp,"w",encoding="utf-8") as fh: json.dump(status,fh)
         os.replace(status_tmp,os.path.join(LIVE_FRAMES_FOLDER,f"{safe_id}.json"))
-        print(f"[LIVE] frame received: {student_id} / {status["exam_id"]}")
+        print(f"[LIVE] frame received: {student_id} / {status['exam_id']}")
         return jsonify({"success":True})
     except Exception as e:
         if temp:
@@ -3117,8 +4031,8 @@ def admin_dashboard():
     subjects = {}
     conn = None
 
-    # Prefer the shared Neon exam store so Admin sees the same exams as Student.
-    if os.environ.get("DATABASE_URL", "").strip():
+    # Single source of truth: the shared workbook (Neon on Render).
+    if USE_PUBLIC_EXAMS_TABLE and os.environ.get("DATABASE_URL", "").strip():
         try:
             conn = _shared_db_connection()
             if conn is not None:
@@ -3181,54 +4095,79 @@ def admin_dashboard():
     return render_template("admin_dashboard.html", subjects=list(subjects.values()))
 
 
+ADMIN_LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Login</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex !important;align-items:center !important;justify-content:center !important;background:radial-gradient(circle at 20% 10%,#2a2150,#0a0e1a 55%);font-family:'Segoe UI',Arial,sans-serif;color:#f1f0f7}
+  .box{width:min(400px,92vw);padding:34px 30px;border-radius:18px;background:rgba(20,24,42,.82);border:1px solid rgba(157,133,255,.3);box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .eyebrow{font:600 11px monospace;letter-spacing:.08em;text-transform:uppercase;color:#9d85ff;margin-bottom:8px}
+  h1{margin:0 0 18px;font-size:26px}
+  label{display:block;margin:14px 0 6px;font-size:13px;color:#b7b3cc}
+  input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid #2c3454;background:#0e1325;color:#f1f0f7;font-size:15px;outline:none}
+  input:focus{border-color:#9d85ff}
+  button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:10px;background:linear-gradient(135deg,#7c5cff,#ff6fa4);color:#fff;font-weight:700;font-size:15px;cursor:pointer}
+  .err{margin:0 0 12px;padding:10px 12px;border-radius:8px;background:#32191d;border:1px solid #5c2a2a;color:#fca5a5;font-size:13.5px}
+  .ok{margin:0 0 12px;padding:10px 12px;border-radius:8px;background:#143322;border:1px solid #245c3a;color:#86efac;font-size:13.5px}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="eyebrow">Oversight Access</div>
+    <h1>Admin Login</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="{{ 'ok' if category == 'success' else 'err' }}">{{ message }}</div>
+      {% endfor %}
+    {% endwith %}
+    <form method="POST" autocomplete="off">
+      <label for="admin_id">Admin ID</label>
+      <input type="text" id="admin_id" name="admin_id" required autofocus>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+      <button type="submit">Login</button>
+    </form>
+  </div>
+</body>
+</html>
+"""
+
+
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-
+    """Single-admin login. There is intentionally no registration."""
     if request.method == "POST":
-
-        admin_id = request.form["admin_id"].strip()
-        password = request.form["password"]
-
+        admin_id = request.form.get("admin_id", "").strip()
+        password = request.form.get("password", "")
+        found = None
         workbook = load_database()
-
-        sheet = workbook["Admins"]
-
-        admin_found = False
-
-        for row in sheet.iter_rows(
-            min_row=2,
-            values_only=True
-        ):
-
-            if (
-                str(row[0]) == admin_id
-                and str(row[3]) == password
-            ):
-
-                session["admin_id"] = row[0]
-                session["admin_name"] = row[1]
-                session["admin_email"] = row[2]
-
-                admin_found = True
-
-                break
-
-        workbook.close()
-
-        if admin_found:
-
-            return redirect(
-                url_for("admin_dashboard")
-            )
-
-        flash(
-            "Invalid Admin ID or password.",
-            "error"
-        )
-
-    return render_template(
-        "admin_login.html"
-    )
+        try:
+            for row in workbook["Admins"].iter_rows(min_row=2, values_only=True):
+                if str(row[0]).strip() != admin_id:
+                    continue
+                stored = str(row[3] if len(row) > 3 and row[3] is not None else "")
+                ok = False
+                if stored.startswith(("scrypt:", "pbkdf2:")):
+                    try: ok = check_password_hash(stored, password)
+                    except Exception: ok = False
+                else:
+                    ok = hmac.compare_digest(stored, password)
+                if ok:
+                    found = row
+                    break
+        finally:
+            workbook.close()
+        if found:
+            session["admin_id"] = found[0]
+            session["admin_name"] = found[1]
+            session["admin_email"] = found[2]
+            return redirect(url_for("admin_dashboard"))
+        flash("Invalid Admin ID or password.", "error")
+    return render_template_string(ADMIN_LOGIN_HTML)
 
 
 # ==========================================
@@ -3259,80 +4198,165 @@ def admin_logout():
 # ============================================================
 
 
+def _own_recording_prefixes(student_id):
+    sid = str(student_id or "").strip()
+    a = "".join(c for c in sid if c.isalnum() or c in "-_")
+    b = re.sub(r"[^A-Za-z0-9._-]+", "_", sid)[:100]
+    return tuple(x + "_" for x in {a, b} if x)
+
+
+def _recording_entries_for_subject(exam_id):
+    """All finished attempts of the subject that `exam_id` belongs to.
+
+    Every entry is tied to exactly one student's Results row. A recording is
+    only attached to an entry when its file name starts with THAT student's own
+    id, so one student's video can never show up under another student.
+    """
+    entries, subject_code, subject_name = [], "", ""
+    wb = load_database(read_only=True, data_only=True)
+    try:
+        wanted_exam = str(exam_id).strip()
+        if "Exams" in wb.sheetnames:
+            for row in wb["Exams"].iter_rows(min_row=2, values_only=True):
+                if row and str(row[0] or "").strip() == wanted_exam:
+                    subject_name = str(row[3] or "")
+                    subject_code = str(row[4] or "")
+                    break
+        if "Results" not in wb.sheetnames:
+            return entries, subject_name, subject_code
+        ws = wb["Results"]
+        headers = [c.value for c in ws[1]]
+        hi = {name: i for i, name in enumerate(headers) if name is not None}
+        rows = list(ws.iter_rows(min_row=2, values_only=True))
+
+        def cell(row, col, default=""):
+            idx = hi.get(col)
+            if idx is None or idx >= len(row) or row[idx] is None:
+                return default
+            return row[idx]
+
+        if not subject_code:
+            for row in rows:
+                if str(cell(row, "Exam ID")).strip() == wanted_exam:
+                    subject_code = str(cell(row, "Subject Code"))
+                    subject_name = subject_name or str(cell(row, "Subject Name"))
+                    break
+
+        for row in rows:
+            same_exam = str(cell(row, "Exam ID")).strip() == wanted_exam
+            same_subject = bool(subject_code) and str(cell(row, "Subject Code")).strip() == subject_code
+            if not (same_exam or same_subject):
+                continue
+            student_id = str(cell(row, "Student ID")).strip()
+            recording_name = os.path.basename(str(cell(row, "Recording File")).strip())
+            if recording_name and not recording_name.startswith(_own_recording_prefixes(student_id)):
+                recording_name = ""          # not this student's file: never show it
+            path = os.path.join(RECORDINGS_FOLDER, recording_name) if recording_name else ""
+            cloud = _cloudinary_recording_url(recording_name) if recording_name else ""
+            have_file = bool(recording_name) and os.path.isfile(path)
+            entries.append({
+                "student_id": student_id,
+                "student_name": cell(row, "Student Name", "Unknown"),
+                "student_email": cell(row, "Student Email", ""),
+                "subject_name": cell(row, "Subject Name", subject_name),
+                "exam_id": str(cell(row, "Exam ID")),
+                "submitted_at": cell(row, "Submitted At", ""),
+                "percentage": cell(row, "Percentage", ""),
+                "exam_status": cell(row, "Exam Status", ""),
+                "filename": recording_name if (have_file or cloud) else "",
+                "recording_url": cloud if (recording_name and not have_file) else "",
+                "recording_missing": (not recording_name) or not (have_file or cloud),
+            })
+    finally:
+        wb.close()
+    entries.sort(key=lambda e: str(e.get("submitted_at", "")), reverse=True)
+    return entries, subject_name, subject_code
+
+
+ADMIN_RECORDINGS_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exam Recordings</title>
+<style>
+ body{font-family:'Segoe UI',Arial,sans-serif;background:#faf8f5;color:#201a2e;margin:0;padding:28px}
+ .wrap{max-width:980px;margin:0 auto}
+ h1{margin:0 0 4px;font-size:26px}
+ .sub{color:#655f73;margin:0 0 22px}
+ .panel{background:#fff;border:1px solid #e7e1f2;border-radius:12px;padding:18px;margin-bottom:18px}
+ label{font-weight:600;font-size:14px;display:block;margin-bottom:8px}
+ select{width:100%;max-width:520px;padding:11px 12px;border:1px solid #cfc7e3;border-radius:8px;font-size:15px;background:#fff}
+ .btn{display:inline-block;padding:9px 16px;background:#7c5cff;color:#fff;border:0;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;cursor:pointer}
+ .btn.alt{background:#e7e1f2;color:#201a2e}
+ .meta{display:flex;flex-wrap:wrap;gap:8px 22px;color:#655f73;font-size:13.5px;margin:6px 0 14px}
+ video{width:100%;max-height:520px;background:#000;border-radius:10px}
+ .warn{background:#fff4e5;border:1px solid #f5c58a;color:#8a4b00;padding:12px 14px;border-radius:8px;font-size:14px}
+ .empty{color:#8a8398}
+</style></head><body><div class="wrap">
+<h1>Exam Recordings</h1>
+<p class="sub">{{ subject_name or 'Subject' }}{% if subject_code %} ({{ subject_code }}){% endif %}</p>
+
+<form class="panel" method="get">
+  <label for="student_id">Choose a student</label>
+  <select id="student_id" name="student_id" onchange="this.form.submit()">
+    <option value="">- Select a student -</option>
+    {% for st in students %}
+      <option value="{{ st.student_id }}" {% if st.student_id == selected %}selected{% endif %}>
+        {{ st.student_name }} ({{ st.student_id }}){% if st.student_email %} - {{ st.student_email }}{% endif %}
+      </option>
+    {% endfor %}
+  </select>
+  <noscript><button class="btn" type="submit">Show recording</button></noscript>
+</form>
+
+{% if not students %}
+  <div class="panel empty">No student has completed this subject yet.</div>
+{% elif not selected %}
+  <div class="panel empty">Select a student above to see only that student's recording for this subject.</div>
+{% elif not shown %}
+  <div class="panel empty">This student has no attempt for this subject.</div>
+{% else %}
+  {% for e in shown %}
+  <div class="panel">
+    <h3 style="margin:0">{{ e.student_name }} <span style="color:#8a8398;font-weight:400">({{ e.student_id }})</span></h3>
+    <div class="meta">
+      <span>Exam: {{ e.exam_id }}</span>
+      {% if e.submitted_at %}<span>Submitted: {{ e.submitted_at }}</span>{% endif %}
+      {% if e.exam_status %}<span>Status: {{ e.exam_status }}</span>{% endif %}
+      {% if e.percentage != '' %}<span>Score: {{ e.percentage }}%</span>{% endif %}
+    </div>
+    {% if e.filename %}
+      <video controls preload="metadata" src="{{ e.recording_url or url_for('admin_stream_recording', filename=e.filename) }}"></video>
+      <p><a class="btn" href="{{ url_for('admin_download_recording', filename=e.filename) }}">Download</a></p>
+    {% elif e.recording_missing %}
+      <div class="warn">The recording for this attempt has not arrived yet. If the student only just finished, refresh in a minute. It uploads in the background.</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+{% endif %}
+<p><a class="btn alt" href="{{ url_for('admin_dashboard') }}">Back to Admin Dashboard</a></p>
+</div></body></html>"""
+
+
 @app.route("/admin/exam/<exam_id>/recordings")
 def admin_exam_recordings(exam_id):
-    """
-    FIX: this used to build its file list from a raw folder scan
-    ("any .webm file whose name happens to contain this exam_id"),
-    plus a loose secondary scan of the Results sheet. A substring
-    match like that will also match older/leftover recording files
-    from before recordings used one stable filename per (student,
-    exam) — so old, no-longer-current files kept showing up
-    alongside the real one for the same student ("previous
-    recordings also"). Since a student can only complete a given
-    exam once, the Results sheet already has exactly one row (and
-    therefore, if present, exactly one recording) per student for
-    this exam — so that's now the single source of truth: one entry
-    per completed result row, carrying the student's name, email,
-    subject, and submission time right alongside the recording, and
-    never anything stray.
-    """
-
+    """Pick a student, get ONLY that student's recording for this subject."""
     if "admin_id" not in session:
         return redirect(url_for("admin_login"))
-
-    entries = []
-    subject_name = ""
+    entries, subject_name, subject_code = [], "", ""
     try:
-        wb = load_database(read_only=True, data_only=True)
-        if "Results" in wb.sheetnames:
-            ws = wb["Results"]
-            headers = [c.value for c in ws[1]]
-            hi = {name: i for i, name in enumerate(headers) if name is not None}
-            ei = hi.get("Exam ID")
-            if ei is not None:
-                for row in ws.iter_rows(min_row=2, values_only=True):
-                    if ei >= len(row) or str(row[ei] or "").strip() != str(exam_id).strip():
-                        continue
-
-                    def cell(col_name, default=""):
-                        idx = hi.get(col_name)
-                        if idx is None or idx >= len(row) or row[idx] is None:
-                            return default
-                        return row[idx]
-
-                    subject_name = cell("Subject Name", subject_name) or subject_name
-                    recording_name = os.path.basename(str(cell("Recording File", "")).strip())
-                    recording_path = os.path.join(RECORDINGS_FOLDER, recording_name) if recording_name else ""
-                    entries.append({
-                        "student_id": cell("Student ID", ""),
-                        "student_name": cell("Student Name", "Unknown"),
-                        "student_email": cell("Student Email", ""),
-                        "subject_name": cell("Subject Name", ""),
-                        "submitted_at": cell("Submitted At", ""),
-                        "percentage": cell("Percentage", ""),
-                        "exam_status": cell("Exam Status", ""),
-                        "filename": recording_name if (recording_name and (os.path.isfile(recording_path) or _cloudinary_recording_url(recording_name))) else "",
-                        "recording_url": _cloudinary_recording_url(recording_name) if (recording_name and not os.path.isfile(recording_path)) else "",
-                        "recording_missing": bool(recording_name) and not (os.path.isfile(recording_path) or _cloudinary_recording_url(recording_name)),
-                    })
-        wb.close()
+        entries, subject_name, subject_code = _recording_entries_for_subject(exam_id)
     except Exception as e:
         print("Admin recording lookup warning:", e)
-
-    # Oldest-attempt-first is confusing on a results-style page; show most
-    # recently submitted first, same ordering feel as the old file listing.
-    entries.sort(key=lambda e: str(e.get("submitted_at", "")), reverse=True)
-
-    # Kept for any code/template still expecting a flat filename list.
-    files = [e["filename"] for e in entries if e["filename"]]
-
-    return render_template(
-        "admin_recordings.html",
-        exam_id=exam_id,
-        subject_name=subject_name,
-        entries=entries,
-        files=files
+    seen, students = set(), []
+    for e in sorted(entries, key=lambda x: str(x["student_name"]).lower()):
+        if e["student_id"] and e["student_id"] not in seen:
+            seen.add(e["student_id"])
+            students.append(e)
+    selected = (request.args.get("student_id") or "").strip()
+    shown = [e for e in entries if selected and e["student_id"] == selected]
+    return render_template_string(
+        ADMIN_RECORDINGS_PAGE, subject_name=subject_name, subject_code=subject_code,
+        students=students, selected=selected, shown=shown,
     )
 
 
@@ -3430,7 +4454,7 @@ def admin_download_recording(filename):
     )
 
     if not os.path.isfile(filepath):
-        cloud_url = _cloudinary_recording_url(safe_name)
+        cloud_url = _cloudinary_recording_url(safe_name, download=True)
         return redirect(cloud_url) if cloud_url else ("Recording not found", 404)
 
     return send_from_directory(
@@ -3490,262 +4514,466 @@ def admin_stream_recording(filename):
 # roughly every 1.5s while the exam page is open).
 # ============================================================
 
-LIVE_ACTIVE_WINDOW_SECONDS = 8
+LIVE_ACTIVE_WINDOW_SECONDS = 20
+
+_PULL_CACHE = {"t": 0.0, "data": []}
+_PULL_LOCK = threading.Lock()
+
+
+def _pull_student_live_sessions():
+    """Ask the student server who is live right now. Complements the pushes
+    the student makes, so a dropped heartbeat never hides a student."""
+    if not STUDENT_SIGNAL_BASE_URL or not LIVE_SYNC_TOKEN:
+        return []
+    now = time.time()
+    with _PULL_LOCK:
+        if now - _PULL_CACHE["t"] < 1.5:
+            return list(_PULL_CACHE["data"])
+        _PULL_CACHE["t"] = now          # also throttles retries after a failure
+        try:
+            r = requests.get(
+                f"{STUDENT_SIGNAL_BASE_URL}/internal/live-sessions",
+                headers={"X-ExamGuard-Sync-Token": LIVE_SYNC_TOKEN},
+                timeout=(2.5, 5), verify=STUDENT_SIGNAL_VERIFY_SSL,
+            )
+            data = []
+            if r.ok:
+                for s in (r.json().get("sessions") or []):
+                    try: s["last_seen"] = now - float(s.get("age", 0) or 0)
+                    except Exception: s["last_seen"] = now
+                    data.append(s)
+            _PULL_CACHE["data"] = data
+        except Exception as exc:
+            print("[LIVE PULL] sessions:", exc)
+            _PULL_CACHE["data"] = []
+        return list(_PULL_CACHE["data"])
 
 
 def get_active_live_sessions():
-    """Return exactly one active session per student."""
-    if not os.path.isdir(LIVE_FRAMES_FOLDER): return []
-    now=time.time(); newest={}
-    for filename in os.listdir(LIVE_FRAMES_FOLDER):
-        if not filename.endswith(".json") or filename.endswith(".uploading"): continue
-        path=os.path.join(LIVE_FRAMES_FOLDER,filename)
-        try:
-            with open(path,"r",encoding="utf-8") as fh: data=json.load(fh)
-            sid=str(data.get("student_id","")).strip(); seen=float(data.get("last_seen",0) or 0)
-        except Exception: continue
-        if not sid or now-seen>LIVE_ACTIVE_WINDOW_SECONDS: continue
-        if sid not in newest or seen>=float(newest[sid].get("last_seen",0) or 0): newest[sid]=data
-    result=list(newest.values()); result.sort(key=lambda x:str(x.get("student_name","")))
+    """Exactly one active session per student (pushed files + pulled list)."""
+    now = time.time(); newest = {}
+
+    def consider(data):
+        sid = str(data.get("student_id", "")).strip()
+        try: seen = float(data.get("last_seen", 0) or 0)
+        except Exception: return
+        if not sid or now - seen > LIVE_ACTIVE_WINDOW_SECONDS:
+            return
+        if sid not in newest or seen >= float(newest[sid].get("last_seen", 0) or 0):
+            # keep the richest data for fields the newer record may lack
+            merged = dict(newest.get(sid, {})); merged.update({k: v for k, v in data.items() if v not in (None, "")} )
+            merged["last_seen"] = seen
+            newest[sid] = merged
+
+    if os.path.isdir(LIVE_FRAMES_FOLDER):
+        for filename in os.listdir(LIVE_FRAMES_FOLDER):
+            if not filename.endswith(".json") or filename.endswith(".uploading"): continue
+            try:
+                with open(os.path.join(LIVE_FRAMES_FOLDER, filename), "r", encoding="utf-8") as fh:
+                    consider(json.load(fh))
+            except Exception:
+                continue
+    for s in _pull_student_live_sessions():
+        consider(s)
+    result = list(newest.values()); result.sort(key=lambda x: str(x.get("student_name", "")))
     return result
+
+
+LIVE_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Exam Monitoring</title>
+<style>
+  :root{--bg:#0a0e1a;--card:#141a2c;--line:rgba(255,255,255,.1);--text:#f1f0f7;--muted:#a7a2bd;--accent:#9d85ff;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24}
+  *{box-sizing:border-box}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);padding:26px;margin:0}
+  a.back{color:var(--accent);text-decoration:none;font-size:13.5px}
+  h1{font-size:22px;margin:14px 0 4px}.sub{color:var(--muted);font-size:13.5px;margin-bottom:16px}
+  #voicebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid rgba(157,133,255,.3);border-radius:12px;padding:14px 16px;margin:14px 0 20px}
+  button{font-family:inherit}
+  #voiceBtn{background:var(--accent);color:#fff;border:0;padding:11px 18px;border-radius:8px;font-weight:700;cursor:pointer}
+  #voiceBtn.on{background:var(--ok);color:#07130b}
+  #audioBtn{background:#19a974;color:#fff;border:0;padding:11px 18px;border-radius:8px;font-weight:700;cursor:pointer}
+  #audioBtn.on{background:#0f766e}
+  .muted{color:var(--muted);font-size:12.5px}.dot{width:9px;height:9px;border-radius:50%;background:var(--ok);display:inline-block;margin-right:6px}
+  #count{margin-left:auto;font-weight:700;font-size:13px;color:var(--muted)}
+  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;transition:border-color .2s}
+  .card:hover{border-color:var(--accent)}
+  .card.alert{border-color:var(--bad);box-shadow:0 0 0 1px rgba(248,113,113,.4)}
+  .shot{position:relative;background:#000;aspect-ratio:4/3}
+  .shot img,.shot video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;background:#000}
+  .shot video{opacity:0;transition:opacity .25s}
+  .shot.vid video{opacity:1}
+  .badge{position:absolute;left:8px;top:8px;background:rgba(0,0,0,.68);padding:4px 8px;border-radius:6px;font:600 11px monospace;z-index:3}
+  .wchip{position:absolute;right:8px;top:8px;z-index:3;background:rgba(0,0,0,.68);padding:4px 9px;border-radius:12px;font:700 11px 'Segoe UI',Arial;color:var(--ok)}
+  .wchip.w1{color:var(--warn)}.wchip.w2{color:#fb923c}.wchip.w3{color:var(--bad)}
+  .banner{position:absolute;left:0;right:0;bottom:0;z-index:3;background:rgba(127,29,29,.92);color:#fff;font:600 12px 'Segoe UI',Arial;padding:6px 10px;display:none}
+  .card.alert .banner{display:block}
+  .meta{padding:11px 14px}.name{font-weight:600;font-size:14px}.exam{color:#9891ab;font-size:11.5px;margin-top:2px;font-family:monospace}
+  .status{font-size:12px;margin-top:6px;padding:2px 9px;border-radius:12px;display:inline-block}
+  .s-ok{background:#143322;color:var(--ok);border:1px solid #245c3a}.s-bad{background:#32191d;color:var(--bad);border:1px solid #5c2a2a}.s-end{background:#2a2a35;color:#cbd5e1;border:1px solid #475569}
+  .last{color:#cbd5e1;font-size:11.5px;margin-top:6px;min-height:15px;overflow-wrap:anywhere}
+  #empty{color:#9891ab;padding:60px 0;text-align:center}
+</style>
+</head>
+<body>
+  <a class="back" href="/admin/dashboard">&larr; Back to Admin Dashboard</a>
+  <h1>Live Exam Monitoring</h1>
+  <div class="sub">One live card per student currently taking an exam &mdash; camera, voice and malpractice alerts.</div>
+
+  <div id="voicebar">
+    <button id="voiceBtn" type="button">&#127897; Start Speaking to Students</button>
+    <button id="audioBtn" type="button">&#128266; Enable Student Audio</button>
+    <span id="voiceStatus" class="muted"><span class="dot"></span>Voice broadcast is off</span>
+    <span id="count">0 students live</span>
+  </div>
+
+  <div id="grid"></div>
+  <div id="empty" style="display:none">No students are currently taking an exam.</div>
+
+<script>
+(function(){
+  const ICE = __ICE_SERVERS_JSON__;
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  const countEl = document.getElementById('count');
+  const voiceBtn = document.getElementById('voiceBtn');
+  const audioBtn = document.getElementById('audioBtn');
+  const voiceStatus = document.getElementById('voiceStatus');
+
+  const cards = new Map();            // id -> state
+  const voicePCs = new Map();         // id -> RTCPeerConnection
+  let studentAudioOn = false, voiceRunning = false, adminMic = null, refreshBusy = false;
+
+  const key = id => String(id).replace(/[^A-Za-z0-9_-]/g,'_');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  function setVoiceStatus(t){ voiceStatus.innerHTML = '<span class="dot"></span>' + t; }
+
+  function waitIce(pc, ms){
+    if (pc.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise(res => {
+      const done = () => { clearTimeout(t); pc.removeEventListener('icegatheringstatechange', chk); res(); };
+      const chk = () => { if (pc.iceGatheringState === 'complete') done(); };
+      const t = setTimeout(done, ms || 4000);
+      pc.addEventListener('icegatheringstatechange', chk);
+    });
+  }
+
+  // ------------------------------------------------------------ cards
+  function makeCard(s){
+    const id = String(s.student_id || '').trim();
+    const el = document.createElement('div');
+    el.className = 'card'; el.id = 'card-' + key(id);
+    el.onclick = () => { location.href = '/admin/live/' + encodeURIComponent(id); };
+    el.innerHTML =
+      '<div class="shot">' +
+        '<img alt="" decoding="async">' +
+        '<video autoplay playsinline muted></video>' +
+        '<div class="badge">CONNECTING&hellip;</div>' +
+        '<div class="wchip">Warnings 0/3</div>' +
+        '<div class="banner"></div>' +
+      '</div>' +
+      '<div class="meta"><div class="name"></div><div class="exam"></div>' +
+      '<span class="status s-ok">Normal</span><div class="last"></div></div>';
+    grid.appendChild(el);
+    const st = {
+      id, el, exam: s.exam_id || '', img: el.querySelector('img'), video: el.querySelector('video'),
+      shot: el.querySelector('.shot'), badge: el.querySelector('.badge'), chip: el.querySelector('.wchip'),
+      banner: el.querySelector('.banner'), statusEl: el.querySelector('.status'), lastEl: el.querySelector('.last'),
+      pc: null, busy: false, vidSince: 0, lastTime: -1, lastAdv: Date.now(), frameBusy: false, retryAt: 0, audioBusy: false,
+      connectStarted: 0
+    };
+    cards.set(id, st);
+    startVideoPeer(st);
+    return st;
+  }
+
+  function updateCard(s){
+    const id = String(s.student_id || '').trim(); if (!id) return;
+    const st = cards.get(id) || makeCard(s);
+    st.exam = s.exam_id || st.exam;
+    st.el.querySelector('.name').textContent = s.student_name || id;
+    st.el.querySelector('.exam').textContent = s.exam_id || '';
+    const n = Math.max(0, parseInt(s.violation_count || 0, 10));
+    st.chip.textContent = 'Warnings ' + Math.min(n, 3) + '/3';
+    st.chip.className = 'wchip' + (n >= 1 ? ' w' + Math.min(n, 3) : '');
+    const warn = !!s.warning;
+    const ended = !!s.terminated;
+    st.el.classList.toggle('alert', warn);
+    st.banner.textContent = warn ? ('⚠ ' + (s.warning_message || 'Malpractice detected')) : '';
+    st.statusEl.className = 'status ' + (ended ? 's-end' : (warn ? 's-bad' : 's-ok'));
+    st.statusEl.textContent = ended ? 'Exam ended' : (warn ? (s.warning_message || 'Warning') : 'Normal');
+    st.lastEl.textContent = s.last_violation ? ('Last: ' + s.last_violation) : '';
+  }
+
+  function removeCard(id){
+    const st = cards.get(id); if (!st) return;
+    stopVideoPeer(st);
+    st.el.remove(); cards.delete(id);
+  }
+
+  async function refreshGrid(){
+    if (refreshBusy) return; refreshBusy = true;
+    try {
+      const res = await fetch('/admin/live-status', {cache: 'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const raw = await res.json();
+      const by = new Map();
+      for (const s of raw) { const id = String(s.student_id || '').trim(); if (id) by.set(id, s); }
+      for (const s of by.values()) updateCard(s);
+      for (const id of Array.from(cards.keys())) if (!by.has(id)) removeCard(id);
+      empty.style.display = by.size ? 'none' : 'block';
+      countEl.textContent = by.size + ' student' + (by.size === 1 ? '' : 's') + ' live';
+    } catch (e) { console.error('[LIVE GRID]', e); }
+    finally { refreshBusy = false; }
+  }
+
+  // --------------------------------------------- JPEG fallback (always on)
+  function refreshFrames(){
+    cards.forEach(st => {
+      if (st.frameBusy) return;
+      st.frameBusy = true;
+      const im = new Image();
+      im.onload = () => { st.img.src = im.src; st.frameBusy = false; if (!st.shot.classList.contains('vid')) st.badge.textContent = '● LIVE (snapshot)'; };
+      im.onerror = () => { st.frameBusy = false; };
+      im.src = '/admin/live-frame/' + encodeURIComponent(st.id) + '?t=' + Date.now();
+    });
+  }
+
+  // ------------------------------------------------ WebRTC camera + audio
+  function stopVideoPeer(st){
+    if (st.pc) { try { st.pc.close(); } catch (e) {} st.pc = null; }
+    st.shot.classList.remove('vid'); st.vidSince = 0;
+    try { st.video.srcObject = null; } catch (e) {}
+    fetch('/admin/video/stop/' + encodeURIComponent(st.id), {method: 'POST'}).catch(() => {});
+  }
+
+  async function startVideoPeer(st){
+    if (st.busy || !cards.has(st.id)) return;
+    if (Date.now() < st.retryAt) return;
+    st.busy = true; st.connectStarted = Date.now();
+    try {
+      if (st.pc) { try { st.pc.close(); } catch (e) {} st.pc = null; }
+      const pc = new RTCPeerConnection({iceServers: ICE});
+      st.pc = pc;
+      pc.addTransceiver('video', {direction: 'recvonly'});
+      pc.addTransceiver('audio', {direction: 'recvonly'});
+      const remote = new MediaStream();
+      pc.ontrack = e => {
+        if (e.track && !remote.getTracks().some(t => t.id === e.track.id)) remote.addTrack(e.track);
+        st.video.srcObject = remote;
+        st.video.muted = !studentAudioOn;
+        st.video.volume = 1.0;
+        st.video.play().catch(() => {});
+      };
+      pc.onconnectionstatechange = () => {
+        if (st.pc !== pc) return;
+        if (['failed', 'closed'].includes(pc.connectionState)) {
+          st.shot.classList.remove('vid');
+          st.retryAt = Date.now() + 1500;
+          try { pc.close(); } catch (e) {}
+          st.pc = null;
+        }
+      };
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIce(pc, 4000);
+      const r = await fetch('/admin/video/offer', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({student_id: st.id, exam_id: st.exam, offer: pc.localDescription})
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.success) throw new Error(d.error || ('offer HTTP ' + r.status));
+      pollAnswer(st, pc);
+    } catch (e) {
+      console.debug('[LIVE VIDEO]', st.id, e);
+      if (st.pc) { try { st.pc.close(); } catch (_) {} st.pc = null; }
+      st.retryAt = Date.now() + 3000;
+    } finally { st.busy = false; }
+  }
+
+  async function pollAnswer(st, pc){
+    for (let n = 0; n < 45; n++) {
+      if (st.pc !== pc) return;
+      try {
+        const r = await fetch('/admin/video/answer/' + encodeURIComponent(st.id) + '?t=' + Date.now(), {cache: 'no-store'});
+        if (r.ok) {
+          const d = await r.json();
+          if (d.success && d.answer) { await pc.setRemoteDescription(new RTCSessionDescription(d.answer)); return; }
+        }
+      } catch (e) {}
+      await sleep(350);
+    }
+    if (st.pc === pc && pc.connectionState !== 'connected') {
+      try { pc.close(); } catch (e) {} st.pc = null; st.retryAt = Date.now() + 1500;
+    }
+  }
+
+  // Supervises every card: detects frozen/never-connected video and retries.
+  function superviseVideo(){
+    const now = Date.now();
+    cards.forEach(st => {
+      const v = st.video;
+      const playing = v.srcObject && v.videoWidth > 0 && !v.paused && v.readyState >= 2;
+      if (playing) {
+        if (v.currentTime !== st.lastTime) { st.lastTime = v.currentTime; st.lastAdv = now; }
+        if (now - st.lastAdv > 6000) { // frozen
+          st.shot.classList.remove('vid');
+          if (st.pc) { try { st.pc.close(); } catch (e) {} st.pc = null; }
+          st.retryAt = 0;
+        } else {
+          st.shot.classList.add('vid');
+          const hasA = v.srcObject.getAudioTracks().length > 0;
+          st.badge.textContent = hasA ? '● LIVE VIDEO + AUDIO' : '● LIVE VIDEO';
+        }
+      } else {
+        st.shot.classList.remove('vid');
+        if (!st.pc && !st.busy) startVideoPeer(st);
+        else if (st.pc && now - st.connectStarted > 15000 && st.pc.connectionState !== 'connected') {
+          try { st.pc.close(); } catch (e) {} st.pc = null; st.retryAt = 0;
+        }
+      }
+    });
+  }
+
+  // ---------------- student audio fallback (when WebRTC audio is absent)
+  async function audioFallback(){
+    if (!studentAudioOn) return;
+    for (const st of cards.values()) {
+      if (st.shot.classList.contains('vid') || st.audioBusy) continue;
+      st.audioBusy = true;
+      try {
+        const r = await fetch('/admin/live-audio/' + encodeURIComponent(st.id) + '?t=' + Date.now(), {cache: 'no-store'});
+        if (r.status === 200) {
+          const blob = await r.blob();
+          if (blob.size > 256) {
+            const a = new Audio(URL.createObjectURL(blob));
+            a.onended = () => URL.revokeObjectURL(a.src);
+            await a.play().catch(() => {});
+          }
+        }
+      } catch (e) {}
+      st.audioBusy = false;
+    }
+  }
+
+  async function enableStudentAudio(){
+    studentAudioOn = true;
+    audioBtn.textContent = '🔊 Student Audio ON'; audioBtn.classList.add('on');
+    for (const st of cards.values()) { st.video.muted = false; st.video.volume = 1; try { await st.video.play(); } catch (e) {} }
+  }
+
+  // --------------------------------------- admin -> students voice
+  async function startVoiceStudent(s){
+    const id = String(s.student_id || ''), exam = String(s.exam_id || '');
+    if (!id || !exam || voicePCs.has(id) || !adminMic) return;
+    const pc = new RTCPeerConnection({iceServers: ICE});
+    pc._created = Date.now();
+    voicePCs.set(id, pc);
+    adminMic.getTracks().forEach(t => pc.addTrack(t, adminMic));
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'closed'].includes(pc.connectionState) && voicePCs.get(id) === pc) {
+        voicePCs.delete(id); try { pc.close(); } catch (e) {}
+      }
+    };
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitIce(pc, 4000);
+      const r = await fetch('/admin/voice/offer', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({student_id: id, exam_id: exam, offer: pc.localDescription})
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.success) throw new Error(d.error || 'voice offer failed');
+    } catch (e) {
+      try { pc.close(); } catch (_) {}
+      if (voicePCs.get(id) === pc) voicePCs.delete(id);
+    }
+  }
+
+  async function pollVoiceAnswers(){
+    for (const [id, pc] of Array.from(voicePCs.entries())) {
+      if (pc.currentRemoteDescription) continue;
+      if (Date.now() - pc._created > 25000) { // student never answered: retry fresh
+        try { pc.close(); } catch (e) {} voicePCs.delete(id);
+        fetch('/admin/voice/stop/' + encodeURIComponent(id), {method: 'POST'}).catch(() => {});
+        continue;
+      }
+      try {
+        const r = await fetch('/admin/voice/answer/' + encodeURIComponent(id) + '?t=' + Date.now(), {cache: 'no-store'});
+        const d = await r.json();
+        if (d.success && d.answer && !pc.currentRemoteDescription) await pc.setRemoteDescription(new RTCSessionDescription(d.answer));
+      } catch (e) {}
+    }
+  }
+
+  async function syncVoiceStudents(){
+    if (!voiceRunning) return;
+    try {
+      const res = await fetch('/admin/live-status', {cache: 'no-store'});
+      const list = await res.json();
+      const ids = new Set(list.map(s => String(s.student_id)));
+      for (const [id, pc] of Array.from(voicePCs.entries())) if (!ids.has(id)) { try { pc.close(); } catch (e) {} voicePCs.delete(id); }
+      await Promise.all(list.map(startVoiceStudent));
+      let connected = 0; voicePCs.forEach(pc => { if (pc.connectionState === 'connected') connected++; });
+      setVoiceStatus('Broadcast ON — ' + connected + ' of ' + list.length + ' student' + (list.length === 1 ? '' : 's') + ' hearing you');
+    } catch (e) { setVoiceStatus('Broadcast ON — waiting for students'); }
+  }
+
+  async function stopVoice(){
+    voiceRunning = false;
+    for (const [id, pc] of Array.from(voicePCs.entries())) {
+      try { pc.close(); } catch (e) {}
+      fetch('/admin/voice/stop/' + encodeURIComponent(id), {method: 'POST'}).catch(() => {});
+    }
+    voicePCs.clear();
+    if (adminMic) adminMic.getTracks().forEach(t => t.stop());
+    adminMic = null;
+    voiceBtn.innerHTML = '&#127897; Start Speaking to Students'; voiceBtn.classList.remove('on');
+    setVoiceStatus('Voice broadcast is off');
+  }
+
+  async function startVoice(){
+    try {
+      adminMic = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true}, video: false});
+      voiceRunning = true;
+      voiceBtn.innerHTML = '&#128308; Stop Speaking'; voiceBtn.classList.add('on');
+      await syncVoiceStudents();
+    } catch (e) { alert('Microphone access was not granted.'); await stopVoice(); }
+  }
+
+  audioBtn.addEventListener('click', enableStudentAudio);
+  voiceBtn.addEventListener('click', () => voiceRunning ? stopVoice() : startVoice());
+  setInterval(refreshGrid, 1500);
+  setInterval(refreshFrames, 1200);
+  setInterval(superviseVideo, 1500);
+  setInterval(syncVoiceStudents, 2500);
+  setInterval(pollVoiceAnswers, 900);
+  setInterval(audioFallback, 3000);
+  refreshGrid();
+  window.addEventListener('beforeunload', () => {
+    voicePCs.forEach(pc => { try { pc.close(); } catch (e) {} });
+    cards.forEach(st => { if (st.pc) try { st.pc.close(); } catch (e) {} });
+  });
+})();
+</script>
+</body>
+</html>
+"""
 
 
 @app.route("/admin/live")
 def admin_live():
     if "admin_id" not in session:
         return redirect(url_for("admin_login"))
-    html = r"""
-    <!doctype html>
-    <html>
-    <head>
-      <title>Live Exam Monitoring</title>
-      <style>
-        body{font-family:'Segoe UI',Arial,sans-serif;background:#0a0e1a;color:#f1f0f7;padding:30px;margin:0}
-        h1{font-size:22px;margin-bottom:4px}.sub{color:#a7a2bd;font-size:13.5px;margin-bottom:18px}
-        #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
-        .card{background:#141a2c;border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden;cursor:pointer}
-        .card:hover{border-color:#9d85ff}.live-img{width:100%;height:200px;object-fit:cover;display:block;background:#000}
-        .meta{padding:12px 14px}.name{font-weight:600;font-size:14px}.student-exam{color:#9891ab;font-size:11.5px;margin-top:2px;font-family:monospace}
-        .status{font-size:12px;margin-top:5px;padding:2px 8px;border-radius:12px;display:inline-block}
-        .status-normal{background:#143322;color:#4ade80;border:1px solid #245c3a}.status-warning{background:#32191d;color:#f87171;border:1px solid #5c2a2a}
-        #empty{color:#9891ab;padding:60px 0;text-align:center}.back{color:#9d85ff;text-decoration:none;font-size:13.5px}
-        #voicebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#141a2c;border:1px solid rgba(157,133,255,.3);border-radius:12px;padding:14px 16px;margin:16px 0 22px}
-        #voiceBtn{background:#9d85ff;color:#fff;border:0;padding:11px 18px;border-radius:8px;font-weight:700;cursor:pointer}
-        #voiceBtn.on{background:#4ade80;color:#07130b}.muted{color:#a7a2bd;font-size:12.5px}.live-dot{width:9px;height:9px;border-radius:50%;background:#4ade80;display:inline-block;margin-right:6px}
-        .image-state{position:absolute;left:10px;top:10px;background:rgba(0,0,0,.65);padding:4px 8px;border-radius:6px;font:600 11px monospace}
-        .image-wrap{position:relative;background:#000}
-      </style>
-    </head>
-    <body>
-      <a class="back" href="/admin/dashboard">&larr; Back to Admin Dashboard</a>
-      <h1 style="margin-top:16px">Live Exam Monitoring</h1>
-      <div class="sub">One live card per active student. Camera preview is separate from AI analysis.</div>
-      <div id="voicebar">
-        <button id="voiceBtn">🎙 Start Speaking to Students</button>
-       <button id="audioBtn" style="margin-left:10px;background:#19a974">🔊 Enable Student Audio</button>
-        <span id="voiceStatus" class="muted"><span class="live-dot"></span>Voice broadcast is off</span>
-      </div>
-      <div id="grid"></div>
-      <div id="empty" style="display:none">No students are currently taking an exam.</div>
-      <script>
-        const voicePeerConnections = new Map();
-        const videoPeerConnections = new Map();
-        const videoOfferBusy = new Set();
-        const videoOfferTimers = new Map();
-        let adminMicStream = null, voiceRunning = false, refreshBusy = false, studentAudioEnabled = false;
-        const grid = document.getElementById('grid');
-        const empty = document.getElementById('empty');
-        const voiceBtn = document.getElementById('voiceBtn');
-        const voiceStatus = document.getElementById('voiceStatus');
-
-        function setVoiceStatus(text){ voiceStatus.innerHTML='<span class="live-dot"></span>'+text; }
-        function safeDomId(id){ return 'live-card-'+String(id).replace(/[^A-Za-z0-9_-]/g,'_'); }
-        function waitIce(pc, timeoutMs=5000){
-          if(pc.iceGatheringState==='complete') return Promise.resolve();
-          return new Promise(resolve=>{
-            let done=false;
-            const finish=()=>{if(done)return;done=true;clearTimeout(timer);pc.removeEventListener('icegatheringstatechange',check);resolve();};
-            const check=()=>{if(pc.iceGatheringState==='complete')finish();};
-            const timer=setTimeout(finish,timeoutMs);
-            pc.addEventListener('icegatheringstatechange',check); check();
-          });
-        }
-
-        async function startVideoPeer(s){
-          const id=String(s.student_id||'').trim(), exam=String(s.exam_id||'').trim();
-          if(!id || !exam || videoOfferBusy.has(id)) return;
-          const old=videoPeerConnections.get(id);
-          if(old && ['connected','connecting'].includes(old.connectionState)) return;
-          videoOfferBusy.add(id);
-          try{
-            if(old){try{old.close();}catch(e){} videoPeerConnections.delete(id);}
-            const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});
-            videoPeerConnections.set(id,pc);
-            pc.addTransceiver('video',{direction:'recvonly'});
-             pc.addTransceiver('audio',{direction:'recvonly'});
-            const img=document.getElementById('live-img-'+id.replace(/[^A-Za-z0-9_-]/g,'_'));
-            if(img){
-              const v=document.createElement('video');
-              v.className='live-img'; v.autoplay=true; v.playsInline=true; v.muted=!studentAudioEnabled;
-              v.id=img.id; v.dataset.studentVideo='1';
-              img.replaceWith(v);
-            }
-            const video=document.getElementById('live-img-'+id.replace(/[^A-Za-z0-9_-]/g,'_'));
-            // Keep one remote MediaStream per student so the same <video> element
-            // receives BOTH the camera track and microphone track. Some browsers
-            // fire ontrack separately for audio and video; replacing srcObject
-            // with a one-track stream would make the other track disappear.
-            const remoteStream=new MediaStream();
-            pc.ontrack=e=>{
-              const track=e.track;
-              if(track && !remoteStream.getTracks().some(t=>t.id===track.id)){
-                remoteStream.addTrack(track);
-              }
-              if(video){
-                video.srcObject=remoteStream;
-                video.muted=!studentAudioEnabled;
-                video.volume=1.0;
-                video.play().catch(()=>{});
-              }
-              const st=document.getElementById('image-state-'+id.replace(/[^A-Za-z0-9_-]/g,'_'));
-              if(st){
-                const hasVideo=remoteStream.getVideoTracks().length>0;
-                const hasAudio=remoteStream.getAudioTracks().length>0;
-                st.textContent=hasVideo && hasAudio ? '● LIVE CAMERA + AUDIO' : (hasVideo ? '● LIVE CAMERA' : '● LIVE AUDIO');
-              }
-              console.log('[LIVE WEBRTC]',id,'track:',track ? track.kind : 'unknown');
-            };
-            pc.onconnectionstatechange=()=>{
-              const st=document.getElementById('image-state-'+id.replace(/[^A-Za-z0-9_-]/g,'_'));
-              if(['failed','disconnected','closed'].includes(pc.connectionState) && st) st.textContent='RECONNECTING CAMERA';
-              if(pc.connectionState==='failed' && videoPeerConnections.get(id)===pc){
-                try{pc.close();}catch(e){} videoPeerConnections.delete(id);
-                setTimeout(()=>{ if(document.getElementById(safeDomId(id))) startVideoPeer(s); },800);
-              }
-            };
-            const offer=await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            await waitIce(pc);
-            const r=await fetch('/admin/video/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({student_id:id,exam_id:exam,offer:pc.localDescription})});
-            const d=await r.json();
-            if(!r.ok || !d.success) throw new Error(d.error||('offer HTTP '+r.status));
-            pollVideoAnswer(id,pc);
-          }catch(e){
-            console.debug('[LIVE VIDEO] offer',id,e);
-            const st=document.getElementById('image-state-'+id.replace(/[^A-Za-z0-9_-]/g,'_'));
-            if(st) st.textContent='WAITING FOR CAMERA';
-            const pc=videoPeerConnections.get(id); if(pc){try{pc.close();}catch(_){}}
-            videoPeerConnections.delete(id);
-            // A failed first attempt must not leave the card stuck forever.
-            // Retry while this student's live card is still present.
-            setTimeout(()=>{ if(document.getElementById(safeDomId(id))) startVideoPeer(s); },2500);
-          }finally{ videoOfferBusy.delete(id); }
-        }
-
-        async function pollVideoAnswer(id,pc){
-          for(let n=0;n<25;n++){
-            if(videoPeerConnections.get(id)!==pc) return;
-            try{
-              const r=await fetch('/admin/video/answer/'+encodeURIComponent(id)+'?t='+Date.now(),{cache:'no-store'});
-              if(r.ok){const d=await r.json(); if(d.success && d.answer){await pc.setRemoteDescription(new RTCSessionDescription(d.answer)); return;}}
-            }catch(e){}
-            await new Promise(r=>setTimeout(r,300));
-          }
-          if(videoPeerConnections.get(id)===pc && pc.connectionState!=='connected'){
-            try{pc.close();}catch(e){} videoPeerConnections.delete(id);
-          }
-        }
-
-        function stopVideoPeer(id){
-          const pc=videoPeerConnections.get(id); if(pc){try{pc.close();}catch(e){}}
-          videoPeerConnections.delete(id);
-        }
-
-        function makeCard(s){
-          const id=String(s.student_id||'').trim(); if(!id)return null;
-          const cardId=safeDomId(id); let card=document.getElementById(cardId); if(card)return card;
-          card=document.createElement('div'); card.className='card'; card.id=cardId; card.dataset.studentId=id;
-          card.onclick=()=>location.href='/admin/live/'+encodeURIComponent(id);
-          const wrap=document.createElement('div'); wrap.className='image-wrap';
-          const video=document.createElement('video');
-          video.className='live-img'; video.id='live-img-'+id.replace(/[^A-Za-z0-9_-]/g,'_'); video.autoplay=true; video.playsInline=true; video.muted=true;
-          video.poster='';
-          const state=document.createElement('div'); state.className='image-state'; state.id='image-state-'+id.replace(/[^A-Za-z0-9_-]/g,'_'); state.textContent='CONNECTING CAMERA';
-          wrap.appendChild(video); wrap.appendChild(state);
-          const meta=document.createElement('div'); meta.className='meta';
-          const nm=document.createElement('div'); nm.className='name'; nm.id='live-name-'+id.replace(/[^A-Za-z0-9_-]/g,'_'); nm.textContent=s.student_name||id;
-          const ex=document.createElement('div'); ex.className='student-exam'; ex.id='live-exam-'+id.replace(/[^A-Za-z0-9_-]/g,'_'); ex.textContent=s.exam_id||'';
-          const st=document.createElement('span'); st.className='status'; st.id='live-status-'+id.replace(/[^A-Za-z0-9_-]/g,'_');
-          meta.appendChild(nm); meta.appendChild(ex); meta.appendChild(st); card.appendChild(wrap); card.appendChild(meta); grid.appendChild(card);
-          startVideoPeer(s); return card;
-        }
-
-        function updateCard(s){
-          const id=String(s.student_id||'').trim(); if(!id)return;
-          makeCard(s); const key=id.replace(/[^A-Za-z0-9_-]/g,'_');
-          const nm=document.getElementById('live-name-'+key), ex=document.getElementById('live-exam-'+key), st=document.getElementById('live-status-'+key);
-          if(nm)nm.textContent=s.student_name||id; if(ex)ex.textContent=s.exam_id||'';
-          if(st){const warning=!!s.warning;st.className='status '+(warning?'status-warning':'status-normal');st.textContent=warning?(s.warning_message||'Warning'):'Normal';}
-        }
-
-        function removeCard(id){ stopVideoPeer(id); const card=document.getElementById(safeDomId(id)); if(card)card.remove(); }
-
-        // --- Existing admin voice broadcast preserved ---
-        async function startVoiceStudent(student){const id=String(student.student_id||'');if(!id||!student.exam_id||voicePeerConnections.has(id))return;const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});voicePeerConnections.set(id,pc);if(adminMicStream)adminMicStream.getTracks().forEach(track=>pc.addTrack(track,adminMicStream));try{const offer=await pc.createOffer();await pc.setLocalDescription(offer);await waitIce(pc);const r=await fetch('/admin/voice/offer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({student_id:id,exam_id:student.exam_id,offer:pc.localDescription})});const d=await r.json();if(!r.ok||!d.success)throw new Error(d.error||'voice offer failed');}catch(e){try{pc.close();}catch(_){}voicePeerConnections.delete(id);}}
-        async function pollVoiceAnswers(){for(const [id,pc] of voicePeerConnections.entries()){if(pc.currentRemoteDescription)continue;try{const r=await fetch('/admin/voice/answer/'+encodeURIComponent(id));const d=await r.json();if(d.success&&d.answer)await pc.setRemoteDescription(new RTCSessionDescription(d.answer));}catch(e){}}}
-        async function syncVoiceStudents(){if(!voiceRunning)return;try{const res=await fetch('/admin/live-status',{cache:'no-store'});const ss=await res.json();for(const s of ss)await startVoiceStudent(s);setVoiceStatus(`Broadcast ON — ${voicePeerConnections.size} student connection${voicePeerConnections.size===1?'':'s'}`);}catch(e){setVoiceStatus('Broadcast ON — waiting for students');}}
-        async function stopVoice(){voiceRunning=false;for(const [id,pc] of voicePeerConnections.entries()){try{pc.close();}catch(e){}fetch('/admin/voice/stop/'+encodeURIComponent(id),{method:'POST'}).catch(()=>{});}voicePeerConnections.clear();if(adminMicStream)adminMicStream.getTracks().forEach(t=>t.stop());adminMicStream=null;voiceBtn.textContent='🎙 Start Speaking to Students';voiceBtn.classList.remove('on');setVoiceStatus('Voice broadcast is off');}
-        async function startVoice(){try{adminMicStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});voiceRunning=true;voiceBtn.textContent='🔴 Stop Speaking';voiceBtn.classList.add('on');await syncVoiceStudents();}catch(e){alert('Microphone access was not granted.');await stopVoice();}}
-        async function waitIce(pc){if(pc.iceGatheringState==='complete')return;await new Promise(resolve=>{const to=setTimeout(resolve,7000);const f=()=>{if(pc.iceGatheringState==='complete'){clearTimeout(to);pc.removeEventListener('icegatheringstatechange',f);resolve();}};pc.addEventListener('icegatheringstatechange',f);});}
-
-        async function refreshGrid(){
-          if(refreshBusy) return;
-          refreshBusy=true;
-          try{
-            const res=await fetch('/admin/live-status',{cache:'no-store'});
-            const raw=await res.json();
-            // Hard dedupe by student ID. Even if a malformed/old status source
-            // returns duplicates, the browser can only render one card.
-            const byStudent=new Map();
-            for(const s of raw){
-              const id=String(s.student_id||'').trim();
-              if(id) byStudent.set(id,s);
-            }
-            const sessions=Array.from(byStudent.values());
-            const activeIds=new Set(sessions.map(s=>String(s.student_id)));
-            empty.style.display=sessions.length?'none':'block';
-            for(const s of sessions) updateCard(s);
-            for(const card of Array.from(grid.children)){
-              const id=String(card.dataset.studentId||'');
-              if(id && !activeIds.has(id)) removeCard(id);
-            }
-          }catch(e){console.error('[LIVE GRID]',e);}finally{refreshBusy=false;}
-        }
-
-        const audioBtn = document.getElementById('audioBtn');
-         async function enableStudentAudio(){
-           studentAudioEnabled=true;
-           audioBtn.textContent='🔊 Student Audio ON';
-           audioBtn.classList.add('on');
-           for(const video of document.querySelectorAll('video[data-student-video="1"], video.live-img')){
-             video.muted=false;
-             video.volume=1.0;
-             try{ await video.play(); }catch(e){ console.debug('[LIVE AUDIO] play',e); }
-           }
-           console.log('[LIVE AUDIO] student audio playback enabled');
-         }
-         audioBtn.addEventListener('click',enableStudentAudio);
-         voiceBtn.addEventListener('click',()=>voiceRunning?stopVoice():startVoice());
-        setInterval(refreshGrid,1000);
-        setInterval(syncVoiceStudents,2500);
-        setInterval(pollVoiceAnswers,800);
-        refreshGrid();
-        window.addEventListener('beforeunload',()=>{for(const [id,pc] of voicePeerConnections.entries()){try{pc.close();}catch(e){}}if(voiceRunning)stopVoice();for(const [id,pc] of videoPeerConnections.entries()){try{pc.close();}catch(e){}}videoPeerConnections.clear();});
-      </script>
-    </body>
-    </html>
-    """
-    return html
+    html = LIVE_PAGE_HTML.replace("__ICE_SERVERS_JSON__", json.dumps(_ice_servers()))
+    resp = app.response_class(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/admin/live-status")
@@ -3773,6 +5001,16 @@ def admin_live_frame(student_id):
         student_base=str(status.get("student_signal_base_url","")).strip().rstrip("/")
     except Exception:
         pass
+    if not student_base:
+        student_base=STUDENT_SIGNAL_BASE_URL
+
+    try:
+        if os.path.isfile(local_path) and time.time() - os.path.getmtime(local_path) < 3.5:
+            response=send_from_directory(LIVE_FRAMES_FOLDER,f"{safe_id}.jpg",mimetype="image/jpeg")
+            response.headers["Cache-Control"]="no-store, no-cache, must-revalidate, max-age=0"
+            return response
+    except OSError:
+        pass
 
     # PRIMARY path for two-computer deployments: pull the newest JPEG
     # directly from the student's Flask server. This avoids relying on a
@@ -3782,7 +5020,7 @@ def admin_live_frame(student_id):
             r=requests.get(
                 f"{student_base}/internal/live-frame/{safe_id}",
                 headers={"X-ExamGuard-Sync-Token":LIVE_SYNC_TOKEN},
-                timeout=(1.2,2.5),
+                timeout=(3,6),
                 verify=STUDENT_SIGNAL_VERIFY_SSL,
             )
             if r.ok and r.content:
@@ -4682,8 +5920,33 @@ def inject_admin_ui(response):
     return response
 
 
+def _bootstrap_for_wsgi():
+    """gunicorn imports this module instead of running __main__, so do the
+    one-time database/column setup and the Cloudinary sweeper here too."""
+    for fn in (initialize_database, ensure_recording_column, ensure_exam_status_column,
+               ensure_result_student_detail_columns, ensure_exam_timing_columns,
+               ensure_exam_duration_column, ensure_violations_sheet, _migrate_public_exams_once):
+        try:
+            fn()
+        except Exception as exc:
+            print("[BOOT]", getattr(fn, "__name__", fn), "skipped:", exc)
+    _start_cloud_sweeper()
+    try:
+        _start_exam_push_thread()
+        _EXAM_PUSH_EVENT.set()
+    except Exception as exc:
+        print("[BOOT] exam push skipped:", exc)
+
+
+if __name__ != "__main__":
+    _bootstrap_for_wsgi()
+
+
 if __name__ == "__main__":
 
+    _start_cloud_sweeper()
+    _start_exam_push_thread()
+    _EXAM_PUSH_EVENT.set()
     initialize_database()
     ensure_recording_column()
     ensure_exam_status_column()
@@ -4691,6 +5954,10 @@ if __name__ == "__main__":
     ensure_exam_timing_columns()
     ensure_exam_duration_column()
     ensure_violations_sheet()
+    try:
+        _migrate_public_exams_once()
+    except Exception as exc:
+        print("[MIGRATE] skipped:", exc)
 
     import socket
     try:

@@ -22,6 +22,60 @@ import tempfile
 import requests
 
 # ============================================================
+# RUNTIME ENVIRONMENT HELPERS (Render / local)
+# ============================================================
+# Render servers run in UTC, while teachers type exam windows in their own
+# local time. Every "is this exam open?" decision therefore uses an explicit
+# exam timezone (default India Standard Time) instead of the server clock.
+from datetime import timedelta, timezone as _dt_timezone
+
+EXAM_TIMEZONE_NAME = os.environ.get("EXAM_TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
+
+
+def _exam_tzinfo():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(EXAM_TIMEZONE_NAME)
+    except Exception:
+        # tzdata missing (some slim images): fall back to a fixed IST offset.
+        return _dt_timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_local():
+    """Current wall-clock time in the exam timezone as a naive datetime."""
+    return datetime.now(_exam_tzinfo()).replace(tzinfo=None)
+
+
+ON_RENDER = (
+    os.environ.get("RENDER", "").strip().lower() == "true"
+    or bool(os.environ.get("RENDER_EXTERNAL_URL", "").strip())
+)
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+
+def _ice_servers():
+    """ICE servers for WebRTC. Add a TURN server via ICE_SERVERS_JSON for
+    students/admins that sit behind strict college/corporate firewalls."""
+    raw = os.environ.get("ICE_SERVERS_JSON", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and parsed:
+                return parsed
+        except Exception as exc:
+            print("[ICE] ICE_SERVERS_JSON ignored:", exc)
+    return [
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
+        {"urls": "stun:stun.cloudflare.com:3478"},
+    ]
+
+# ============================================================
 # REMOTE ADMIN -> STUDENT WEBRTC VOICE SIGNALING
 # ============================================================
 # The audio is peer-to-peer WebRTC. These small in-memory records only
@@ -111,9 +165,15 @@ os.makedirs(os.path.join(RECORDINGS_FOLDER, ".examguard_parts"), exist_ok=True)
 os.makedirs(LIVE_FRAMES_FOLDER, exist_ok=True)
 
 # STUDENT -> ADMIN RESULT / RECORDING SYNC
-ADMIN_SYNC_BASE_URL=os.environ.get("EXAMGUARD_ADMIN_BASE_URL","https://192.168.1.24:5050").rstrip("/")
+ADMIN_URL_EXPLICIT = bool(os.environ.get("EXAMGUARD_ADMIN_BASE_URL", "").strip()) or ON_RENDER
+ADMIN_SYNC_BASE_URL = (
+    os.environ.get("EXAMGUARD_ADMIN_BASE_URL", "").strip().rstrip("/")
+    or ("https://smart-exam-admin.onrender.com" if ON_RENDER else "https://192.168.1.24:5050")
+)
 ADMIN_SYNC_TOKEN=os.environ.get("EXAMGUARD_RECORDING_SYNC_TOKEN","EXAMGUARD-RECORDING-2026-LOCAL").strip()
-ADMIN_SYNC_VERIFY_SSL=os.environ.get("EXAMGUARD_ADMIN_VERIFY_SSL","false").strip().lower() in ("1","true","yes","on")
+ADMIN_SYNC_VERIFY_SSL = os.environ.get(
+    "EXAMGUARD_ADMIN_VERIFY_SSL", "true" if ON_RENDER else "false"
+).strip().lower() in ("1", "true", "yes", "on")
 LIVE_MONITOR_BUILD="V3-DIRECT-PULL"
 LIVE_SYNC_TOKEN=os.environ.get("EXAMGUARD_LIVE_SYNC_TOKEN","EXAMGUARD-LIVE-2026-LOCAL").strip()
 
@@ -361,6 +421,344 @@ def _shared_save_workbook(workbook):
     return _shared_workbook_write(buffer.getvalue())
 
 
+# ============================================================
+# EXAMGUARD SHARED STORE v2  (single source of truth)
+# ------------------------------------------------------------
+# Admin and Student services BOTH read and write the same workbook that
+# lives in Neon (table public.examguard_workbook_store). Before this block the
+# admin service used its own local database.xlsx, which is wiped on every
+# Render restart and is never seen by the student service. That is why new
+# exams never reached students, results never reached teachers, and delete
+# reported "not authorized".
+#
+# Safety rules implemented here:
+#   * Writes are serialised by a Postgres advisory lock.
+#   * If somebody else saved after we loaded, our changes are re-applied on
+#     top of the newest copy (row-level three-way merge) so two students
+#     submitting at the same second never overwrite each other.
+#   * A freshly created blank workbook can NEVER replace existing data.
+#   * `exams_version` changes only when the Exams sheet changes; the student
+#     dashboard polls it to refresh instantly.
+# Without DATABASE_URL (local testing) the original file based behaviour is
+# used unchanged.
+# ============================================================
+import io as _eg_io
+from collections import Counter as _EgCounter
+
+_eg_local_load_database = load_database
+_eg_local_save_database = save_database
+
+_EG_STORE_READY = False
+_EG_STORE_READY_LOCK = threading.Lock()
+_EG_VERSION_CACHE = {"t": 0.0, "v": 1}
+_EG_BLOB_CACHE = {"t": 0.0, "data": None, "ver": 0}
+_EG_BLOB_CACHE_LOCK = threading.Lock()
+_EG_LOCAL_EXAMS_VERSION = {"v": int(time.time())}
+_EG_MERGE_SHEETS_WITH_KEY = {"Results": "Result ID"}
+
+
+def _eg_use_neon():
+    return bool(os.environ.get("DATABASE_URL", "").strip())
+
+
+def _eg_conn():
+    import psycopg
+    return psycopg.connect(os.environ["DATABASE_URL"].strip(), connect_timeout=10)
+
+
+def _eg_ensure_store(conn):
+    global _EG_STORE_READY
+    if _EG_STORE_READY:
+        return
+    with _EG_STORE_READY_LOCK:
+        if _EG_STORE_READY:
+            return
+        last = None
+        for _ in range(3):
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS public.examguard_workbook_store (
+                            store_id INTEGER PRIMARY KEY CHECK (store_id = 1),
+                            workbook_bytes BYTEA NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )""")
+                    cur.execute("ALTER TABLE public.examguard_workbook_store "
+                                "ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1")
+                    cur.execute("ALTER TABLE public.examguard_workbook_store "
+                                "ADD COLUMN IF NOT EXISTS exams_version BIGINT NOT NULL DEFAULT 1")
+                conn.commit()
+                _EG_STORE_READY = True
+                return
+            except Exception as exc:       # two services creating it at once
+                last = exc
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(0.3)
+        raise last
+
+
+def _eg_norm_rows(ws):
+    rows = []
+    for r in ws.iter_rows(values_only=True):
+        t = tuple(r)
+        end = len(t)
+        while end > 0 and t[end - 1] is None:
+            end -= 1
+        rows.append(t[:end])
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
+def _eg_fetch(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT workbook_bytes, version FROM public.examguard_workbook_store WHERE store_id=1")
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None, 0
+    return bytes(row[0]), int(row[1] or 1)
+
+
+def _eg_seed_from_local(conn):
+    """Seed Neon once from a local workbook (first ever deploy only)."""
+    try:
+        if _valid_xlsx(DATABASE):
+            with open(DATABASE, "rb") as fh:
+                data = fh.read()
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, version, exams_version) "
+                            "VALUES (1, %s, 1, 1) ON CONFLICT (store_id) DO NOTHING", (data,))
+            conn.commit()
+            print("[STORE] Seeded shared workbook from local database.xlsx")
+    except Exception as exc:
+        print("[STORE] Seed skipped:", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+def _eg_get_blob(fresh=True):
+    """Return (bytes, version) of the shared workbook."""
+    if not fresh:
+        with _EG_BLOB_CACHE_LOCK:
+            if _EG_BLOB_CACHE["data"] is not None and time.time() - _EG_BLOB_CACHE["t"] < 1.5:
+                return _EG_BLOB_CACHE["data"], _EG_BLOB_CACHE["ver"]
+    last = None
+    for attempt in range(4):
+        conn = None
+        try:
+            conn = _eg_conn()
+            _eg_ensure_store(conn)
+            data, ver = _eg_fetch(conn)
+            if data is None:
+                _eg_seed_from_local(conn)
+                data, ver = _eg_fetch(conn)
+            if data is None:
+                return None, 0
+            with _EG_BLOB_CACHE_LOCK:
+                _EG_BLOB_CACHE.update({"t": time.time(), "data": data, "ver": ver})
+            return data, ver
+        except Exception as exc:
+            last = exc
+            time.sleep(0.25 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Shared database is unreachable: {last}")
+
+
+def load_database(*args, **kwargs):
+    if not _eg_use_neon():
+        return _eg_local_load_database(*args, **kwargs)
+    read_only = bool(kwargs.get("read_only"))
+    data, ver = _eg_get_blob(fresh=not read_only)
+    if data is None:
+        # Brand new Neon database and no local file: create the blank schema once.
+        try:
+            initialize_database()
+        except Exception as exc:
+            print("[STORE] initialize_database failed:", exc)
+        data, ver = _eg_get_blob(fresh=True)
+        if data is None:
+            raise RuntimeError("Shared workbook could not be created")
+    wb = load_workbook(_eg_io.BytesIO(data), *args, **kwargs)
+    if not read_only:
+        wb._eg_base_version = ver
+        wb._eg_base = {ws.title: _eg_norm_rows(ws) for ws in wb.worksheets}
+    return wb
+
+
+def _eg_merge_rows(name, base_rows, mine_rows, theirs_rows):
+    """Re-apply my row additions/removals on top of the newest rows."""
+    if base_rows == theirs_rows:
+        return list(mine_rows)
+    b_head = base_rows[0] if base_rows else ()
+    m_head = mine_rows[0] if mine_rows else ()
+    t_head = theirs_rows[0] if theirs_rows else ()
+    if m_head != b_head:
+        head = m_head if len(m_head) >= len(t_head) else t_head
+    else:
+        head = t_head or m_head
+    base_body, mine_body, theirs_body = base_rows[1:], mine_rows[1:], theirs_rows[1:]
+    added = _EgCounter(mine_body) - _EgCounter(base_body)
+    removed = _EgCounter(base_body) - _EgCounter(mine_body)
+    body = []
+    for row in theirs_body:
+        if removed.get(row, 0) > 0:
+            removed[row] -= 1
+            continue
+        body.append(row)
+    for row in mine_body:
+        if added.get(row, 0) > 0:
+            added[row] -= 1
+            body.append(row)
+    key_col = _EG_MERGE_SHEETS_WITH_KEY.get(name)
+    if key_col and head and key_col in head:
+        ki = head.index(key_col)
+        rec_i = head.index("Recording File") if "Recording File" in head else None
+        seen, out = {}, []
+        for row in body:
+            key = row[ki] if ki < len(row) else None
+            if key in (None, ""):
+                out.append(row)
+                continue
+            if key in seen:
+                prev = out[seen[key]]
+                if rec_i is not None and (len(row) <= rec_i or not row[rec_i]) and len(prev) > rec_i and prev[rec_i]:
+                    row = tuple(list(row) + [None] * (rec_i + 1 - len(row)))
+                    row = row[:rec_i] + (prev[rec_i],) + row[rec_i + 1:]
+                out[seen[key]] = row
+            else:
+                seen[key] = len(out)
+                out.append(row)
+        body = out
+    return [head] + body if (head or body) else []
+
+
+def _eg_merge_bytes(changed, base, latest_bytes):
+    latest = load_workbook(_eg_io.BytesIO(latest_bytes))
+    for name, mine_rows in changed.items():
+        if name in latest.sheetnames:
+            ws = latest[name]
+            theirs_rows = _eg_norm_rows(ws)
+        else:
+            ws = latest.create_sheet(name)
+            theirs_rows = []
+        merged = _eg_merge_rows(name, base.get(name, []), mine_rows, theirs_rows)
+        if ws.max_row and ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+        for row in merged:
+            ws.append(list(row))
+    out = _eg_io.BytesIO()
+    latest.save(out)
+    latest.close()
+    return out.getvalue()
+
+
+def save_database(workbook):
+    if not _eg_use_neon():
+        return _eg_local_save_database(workbook)
+    base = getattr(workbook, "_eg_base", None)
+    base_ver = getattr(workbook, "_eg_base_version", None)
+    changed = {}
+    for ws in workbook.worksheets:
+        rows = _eg_norm_rows(ws)
+        if base is None or base.get(ws.title) != rows:
+            changed[ws.title] = rows
+    mine = _eg_io.BytesIO()
+    workbook.save(mine)
+    mine_bytes = mine.getvalue()
+    exams_touched = int(("Exams" in changed) or ("ArchivedExams" in changed))
+    last = None
+    for attempt in range(4):
+        conn = None
+        try:
+            conn = _eg_conn()
+            _eg_ensure_store(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_advisory_xact_lock(741209, 1)")
+                cur.execute("SELECT workbook_bytes, version FROM public.examguard_workbook_store "
+                            "WHERE store_id=1 FOR UPDATE")
+                row = cur.fetchone()
+                if row is None or row[0] is None:
+                    cur.execute("INSERT INTO public.examguard_workbook_store(store_id, workbook_bytes, version, exams_version) "
+                                "VALUES (1, %s, 1, 1) ON CONFLICT (store_id) DO UPDATE SET "
+                                "workbook_bytes=EXCLUDED.workbook_bytes, updated_at=NOW()", (mine_bytes,))
+                else:
+                    cur_ver = int(row[1] or 1)
+                    if base is None:
+                        # A workbook that was not loaded from the store (for
+                        # example a blank one created at start-up) must never
+                        # replace existing data.
+                        conn.rollback()
+                        print("[STORE] Ignored a blank-workbook save; shared data already exists")
+                        return True
+                    out_bytes = mine_bytes
+                    if base_ver is not None and cur_ver != base_ver and changed:
+                        out_bytes = _eg_merge_bytes(changed, base, bytes(row[0]))
+                    elif not changed:
+                        conn.rollback()
+                        return True
+                    cur.execute("UPDATE public.examguard_workbook_store SET workbook_bytes=%s, "
+                                "version=version+1, exams_version=exams_version+%s, updated_at=NOW() "
+                                "WHERE store_id=1", (out_bytes, exams_touched))
+            conn.commit()
+            with _EG_BLOB_CACHE_LOCK:
+                _EG_BLOB_CACHE["data"] = None
+            _EG_VERSION_CACHE["t"] = 0.0
+            return True
+        except Exception as exc:
+            last = exc
+            try:
+                if conn is not None:
+                    conn.rollback()
+            except Exception:
+                pass
+            time.sleep(0.3 * (attempt + 1))
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    raise RuntimeError(f"Shared database write failed: {last}")
+
+
+def eg_exams_version():
+    """Cheap counter that changes whenever the Exams sheet changes."""
+    if not _eg_use_neon():
+        return _EG_LOCAL_EXAMS_VERSION["v"]
+    now = time.time()
+    if now - _EG_VERSION_CACHE["t"] < 0.5:
+        return _EG_VERSION_CACHE["v"]
+    conn = None
+    try:
+        conn = _eg_conn()
+        _eg_ensure_store(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT exams_version FROM public.examguard_workbook_store WHERE store_id=1")
+            row = cur.fetchone()
+        if row:
+            _EG_VERSION_CACHE["v"] = int(row[0] or 1)
+        _EG_VERSION_CACHE["t"] = now
+    except Exception as exc:
+        print("[STORE] exams_version read failed:", exc)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return _EG_VERSION_CACHE["v"]
+
+
 # =========================================================
 # MEDIAPIPE FACE MONITORING SETUP
 # =========================================================
@@ -390,43 +788,51 @@ RIGHT_EYE_TOP = [385, 387]
 RIGHT_EYE_BOTTOM = [373, 380]
 
 EAR_THRESHOLD = 0.20
-MAR_THRESHOLD = 0.60
-# FIX: these were set to 5 degrees / 0.05-0.06 gaze ratio, which is
-# tighter than normal, involuntary head and eye movement — a student
-# looking straight at the screen would still trip "Please look
-# straight" almost constantly. Widened to tolerate natural movement
-# while still catching someone who is genuinely turned away.
-YAW_THRESHOLD = 15
-PITCH_THRESHOLD = 15
-ROLL_THRESHOLD = 12
-GAZE_THRESHOLD_H = 0.12
-GAZE_THRESHOLD_V = 0.14
-FRAME_CHECK = 4
-# FIX: gaze warnings used to fire on a single off-center frame
-# (gaze_off_frames >= 1), unlike every other warning here which
-# requires FRAME_CHECK consecutive bad frames. One noisy frame from
-# pupil-tracking jitter was enough to trigger a false warning, so
-# gaze now needs the same sustained-frames check as the rest.
-GAZE_FRAME_CHECK = FRAME_CHECK
-# FIX: "no face detected" used to fire as a warning on the very
-# first frame with no landmarks, with no debounce at all — unlike
-# every other warning here. Right when an exam starts, the webcam
-# is often still auto-focusing/adjusting exposure, or the very first
-# frame or two just misses a detection by chance; at one warning per
-# monitor poll (every 1.5s) and a 3-strike limit, that alone was
-# enough to auto-submit a student's exam within 4-5 seconds of them
-# starting it, with no actual malpractice. Requiring a few
-# consecutive misses before it counts as a real warning absorbs that
-# startup jitter while still catching someone who is genuinely out
-# of frame.
-NO_FACE_FRAME_CHECK = FRAME_CHECK
+# Inner-lip opening ratio. Talking/yawning pushes this well above a closed
+# mouth (~0.02). It must stay above the threshold on several recent frames.
+MAR_THRESHOLD = 0.28
 
-# Require transient-prone head pose / multiple-face / phone detections to
-# persist for several AI frames before they become a malpractice warning.
-# This prevents one noisy MediaPipe frame from becoming a strike.
-HEAD_POSE_FRAME_CHECK = 4
-MULTIPLE_FACE_FRAME_CHECK = 2
-PHONE_FRAME_CHECK = 2
+# ---- Head pose: DEVIATION (degrees) from the student's own calm baseline ----
+# The first few good frames after the exam starts are used to learn how this
+# particular student sits in front of this particular camera. Warnings are then
+# based on how far the head moves away from that baseline.
+YAW_THRESHOLD = float(os.environ.get("AI_YAW_THRESHOLD", "20"))
+PITCH_THRESHOLD = float(os.environ.get("AI_PITCH_THRESHOLD", "18"))
+ROLL_THRESHOLD = float(os.environ.get("AI_ROLL_THRESHOLD", "18"))
+
+# ---- Eye gaze: DEVIATION of the iris ratio from the student's own baseline ----
+GAZE_THRESHOLD_H = float(os.environ.get("AI_GAZE_H", "0.11"))
+GAZE_THRESHOLD_V = float(os.environ.get("AI_GAZE_V", "0.13"))
+
+CALIBRATION_FRAMES = 5
+
+# ---- Debounce windows. "N of last M" frames (1 frame ~ 1 second) ----
+FRAME_CHECK = 4                     # eyes closed: 4 consecutive frames
+NO_FACE_FRAME_CHECK = 4             # no face at all: 4 consecutive frames
+HEAD_POSE_NEED, HEAD_POSE_WINDOW = 3, 4
+GAZE_NEED, GAZE_WINDOW = 3, 4
+MOUTH_NEED, MOUTH_WINDOW = 3, 4
+MULTI_NEED, MULTI_WINDOW = 2, 3
+PHONE_NEED, PHONE_WINDOW = 2, 4
+# Lighting: mean brightness (0-255) of the camera frame. Below the limit for
+# 3 of the last 4 frames the student gets a "room too dark" warning.
+DIM_MEAN_THRESHOLD = float(os.environ.get("AI_DIM_MEAN", "55"))
+DIM_NEED, DIM_WINDOW = 3, 4
+# No face anywhere in the frame for this many seconds ends the exam.
+NO_FACE_END_SECONDS = float(os.environ.get("AI_NO_FACE_END_SECONDS", "20"))
+# If the calm baseline could not be learnt normally, learn it from whatever
+# single-face frames were seen after this many frames (never stay uncalibrated).
+CALIBRATION_FALLBACK_FRAMES = 12
+ANALYSIS_MAX_WIDTH = 480
+# Kept for backwards compatibility with older code paths.
+GAZE_FRAME_CHECK = GAZE_NEED
+HEAD_POSE_FRAME_CHECK = HEAD_POSE_NEED
+MULTIPLE_FACE_FRAME_CHECK = MULTI_NEED
+PHONE_FRAME_CHECK = PHONE_NEED
+
+# A face smaller than this fraction of the frame width is treated as a poster /
+# far background object, not a second person sitting next to the student.
+FACE_MIN_REL_WIDTH = float(os.environ.get("AI_FACE_MIN_REL_WIDTH", "0.07"))
 
 _DEFAULT_LATEST_STATS = {
     "ear": 0, "mar": 0, "closure": 0, "blink_rate": 0,
@@ -477,7 +883,7 @@ def _new_monitor_state():
         "lock": threading.Lock(),
         "face_mesh": mp_face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=2,
+            max_num_faces=3,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -487,15 +893,26 @@ def _new_monitor_state():
         "blink_count": 0,
         "total_frames": 0,
         "eye_closed_frames": 0,
-        "gaze_off_frames": 0,
-        "mouth_open_frames": 0,
         "no_face_frames": 0,
-        "yaw_bad_frames": 0,
-        "pitch_bad_frames": 0,
-        "roll_bad_frames": 0,
-        "multiple_face_frames": 0,
-        "phone_bad_frames": 0,
         "last_blink_time": 0.0,
+        # sliding "N of last M" windows
+        "yaw_hist": deque(maxlen=HEAD_POSE_WINDOW),
+        "pitch_hist": deque(maxlen=HEAD_POSE_WINDOW),
+        "roll_hist": deque(maxlen=HEAD_POSE_WINDOW),
+        "turned_hist": deque(maxlen=HEAD_POSE_WINDOW),
+        "gaze_hist": deque(maxlen=GAZE_WINDOW),
+        "mouth_hist": deque(maxlen=MOUTH_WINDOW),
+        "multi_hist": deque(maxlen=MULTI_WINDOW),
+        "phone_hist": deque(maxlen=PHONE_WINDOW),
+        "dim_hist": deque(maxlen=DIM_WINDOW),
+        "no_face_since": None,
+        "frame_no": 0,
+        "last_phone_found": False,
+        # per-student calm baseline (head pose + gaze)
+        "calib": {"yaw": [], "pitch": [], "roll": [], "gh": [], "gv": []},
+        "calib_any": {"yaw": [], "pitch": [], "roll": [], "gh": [], "gv": []},
+        "baseline": None,
+        "last_phone_score": 0.0,
         "latest_stats": dict(_DEFAULT_LATEST_STATS),
         "last_seen": time.time(),
     }
@@ -914,410 +1331,369 @@ def calculate_head_pose(
 
 PHONE_DETECTION_AVAILABLE = False
 _object_detector = None
-_phone_check_counter = 0
-# FIX: was 2 (skipped every other frame) + 0.45 threshold. Reports of
-# phones not being detected are consistent with this being too
-# conservative — efficientdet_lite0 is a small/fast model that is
-# already lower-accuracy than a full-size detector, so skipping half
-# the frames on top of a fairly high confidence threshold meant a
-# phone had to be held clearly in frame for a while before it was
-# ever even checked, let alone cleared 0.45 confidence. Checking every
-# frame and lowering the threshold trades a bit of CPU/more sensitivity
-# for meaningfully better catch-rate; PHONE_SCORE_THRESHOLD can be
-# tuned back up if this now over-triggers on false positives.
-PHONE_CHECK_EVERY_N_FRAMES = 3  # check every third AI frame
-PHONE_SCORE_THRESHOLD = 0.35  # balanced sensitivity to reduce false positives
+_PHONE_DETECTOR_LOCK = threading.Lock()
 
-try:
+# efficientdet_lite0 reports a phone held toward a webcam with scores that are
+# frequently 0.30-0.55. The old 0.35 threshold combined with a "must be seen in
+# consecutive frames" counter that was reset by every skipped frame meant a
+# phone could never be confirmed. Now: every frame is checked, a low per-frame
+# threshold is used, and the confirmation is "2 hits in the last 4 frames".
+PHONE_SCORE_THRESHOLD = float(os.environ.get("PHONE_SCORE_THRESHOLD", "0.30"))
+PHONE_LABELS = {"cell phone", "mobile phone", "phone", "cellphone", "smartphone"}
+OBJECT_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/object_detector/"
+    "efficientdet_lite0/float32/1/efficientdet_lite0.tflite"
+)
 
-    from mediapipe.tasks.python import vision as _mp_vision
-    from mediapipe.tasks.python.core.base_options import BaseOptions as _MPBaseOptions
 
-    OBJECT_MODEL_PATH = str(Path(BASE_DIR, "efficientdet_lite0.tflite").resolve()).replace("\\", "/")
+def _find_or_download_object_model():
+    for folder in (BASE_DIR, os.getcwd()):
+        candidate = str(Path(folder, "efficientdet_lite0.tflite").resolve())
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 1_000_000:
+            return candidate
+    target = str(Path(BASE_DIR, "efficientdet_lite0.tflite").resolve())
+    try:
+        print("Mobile phone model not found; downloading efficientdet_lite0.tflite ...")
+        r = requests.get(OBJECT_MODEL_URL, timeout=60)
+        if r.ok and len(r.content) > 1_000_000:
+            with open(target, "wb") as fh:
+                fh.write(r.content)
+            return target
+    except Exception as exc:
+        print("Model download failed:", exc)
+    return ""
 
-    if os.path.exists(OBJECT_MODEL_PATH):
 
-        _object_detector_options = _mp_vision.ObjectDetectorOptions(
-            base_options=_MPBaseOptions(model_asset_path=OBJECT_MODEL_PATH),
+def _init_phone_detector():
+    global PHONE_DETECTION_AVAILABLE, _object_detector
+    try:
+        from mediapipe.tasks.python import vision as _mp_vision
+        from mediapipe.tasks.python.core.base_options import BaseOptions as _MPBaseOptions
+
+        model_path = _find_or_download_object_model()
+        if not model_path:
+            print("Mobile phone detection: DISABLED - efficientdet_lite0.tflite not found "
+                  "next to this script. Everything else runs normally.")
+            return
+        common = dict(
+            base_options=_MPBaseOptions(model_asset_path=model_path.replace("\\", "/")),
             running_mode=_mp_vision.RunningMode.IMAGE,
             score_threshold=PHONE_SCORE_THRESHOLD,
-            max_results=10
+            max_results=10,
         )
-
-        _object_detector = _mp_vision.ObjectDetector.create_from_options(_object_detector_options)
+        try:
+            options = _mp_vision.ObjectDetectorOptions(category_allowlist=["cell phone"], **common)
+        except TypeError:
+            options = _mp_vision.ObjectDetectorOptions(**common)
+        _object_detector = _mp_vision.ObjectDetector.create_from_options(options)
         PHONE_DETECTION_AVAILABLE = True
-        print("Mobile phone detection: ENABLED (model found)")
+        print("Mobile phone detection: ENABLED (", model_path, ")")
+    except Exception as exc:
+        print("Mobile phone detection: DISABLED - setup error:", exc,
+              "| Everything else runs normally without this feature.")
 
-    else:
-        print(
-            "Mobile phone detection: DISABLED — model file not found at "
-            + OBJECT_MODEL_PATH
-            + ". Download efficientdet_lite0.tflite and place it in the same "
-            "folder as this script to enable it. Everything else runs normally."
-        )
 
-except Exception as _phone_setup_error:
-
-    print(
-        "Mobile phone detection: DISABLED — setup error:",
-        str(_phone_setup_error),
-        "| Everything else runs normally without this feature."
-    )
+_init_phone_detector()
 
 
 def detect_phone_in_frame(frame):
-    """Lightweight optional phone detector. It is called only after one face
-    has been found and only every few AI frames, so it cannot overwhelm the
-    student server or falsely classify a no-face frame as a phone warning."""
-    global _phone_check_counter
-    if not PHONE_DETECTION_AVAILABLE:
-        return False
-    _phone_check_counter += 1
-    if _phone_check_counter % PHONE_CHECK_EVERY_N_FRAMES != 0:
-        return False
+    """Return (found, best_score) for a cell phone anywhere in the frame."""
+    if not PHONE_DETECTION_AVAILABLE or _object_detector is None:
+        return False, 0.0
     try:
-        import mediapipe as _mp_full
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = _mp_full.Image(image_format=_mp_full.ImageFormat.SRGB, data=rgb)
-        result = _object_detector.detect(image)
+        rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        with _PHONE_DETECTOR_LOCK:
+            result = _object_detector.detect(image)
+        best = 0.0
         for detection in result.detections:
             for category in detection.categories:
-                name = (category.category_name or '').strip().lower()
-                if name in {'cell phone', 'mobile phone', 'phone'} and category.score >= PHONE_SCORE_THRESHOLD:
-                    print(f"Phone detected: category={name}, score={category.score:.2f}")
-                    return True
-        return False
+                name = (category.category_name or "").strip().lower()
+                if name in PHONE_LABELS:
+                    best = max(best, float(category.score or 0.0))
+        return best >= PHONE_SCORE_THRESHOLD, best
     except Exception as exc:
-        print('Phone detection frame error (ignored):', exc)
-        return False
+        print("Phone detection frame error (ignored):", exc)
+        return False, 0.0
+
+
+# A dedicated full-range face detector is far better than FaceMesh at noticing a
+# second (smaller / further away / partly turned) person in the frame.
+_FACE_DETECTOR = None
+_FACE_DETECTOR_LOCK = threading.Lock()
+try:
+    _FACE_DETECTOR = mp.solutions.face_detection.FaceDetection(
+        model_selection=1, min_detection_confidence=0.55
+    )
+except Exception as _fd_exc:
+    print("Face detector unavailable (multiple-face check uses FaceMesh only):", _fd_exc)
+
+
+def count_faces_detector(rgb):
+    if _FACE_DETECTOR is None:
+        return 0
+    try:
+        with _FACE_DETECTOR_LOCK:
+            res = _FACE_DETECTOR.process(rgb)
+        n = 0
+        for det in (res.detections or []):
+            box = det.location_data.relative_bounding_box
+            if box.width >= FACE_MIN_REL_WIDTH:
+                n += 1
+        return n
+    except Exception as exc:
+        print("Face detector frame error (ignored):", exc)
+        return 0
+
+
+def _hist_confirm(hist, value, need):
+    hist.append(bool(value))
+    return sum(1 for item in hist if item) >= need
+
+
+def _median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else 0.0
+
+
+def _face_area(landmarks):
+    xs = [p.x for p in landmarks]
+    ys = [p.y for p in landmarks]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def _blank_stats(face_count, status, warnings):
+    top = warnings[0] if warnings else None
+    return {
+        "ear": 0, "mar": 0, "closure": 0, "blink_rate": 0, "blink_count": 0,
+        "yaw": 0, "pitch": 0, "roll": 0, "face_count": face_count,
+        "status": status, "eyes": "Unknown", "mouth": "Unknown",
+        "looking": "Unknown", "head_pose": "Unknown", "eye_gaze": "Unknown",
+        "gaze_ratio": 0.5,
+        "warning": bool(warnings),
+        "warning_message": top[1] if top else "",
+        "warning_type": top[0] if top else "",
+        "warnings": [{"type": t, "message": m} for t, m in warnings],
+    }
+
 
 def analyze_face_frame(frame, monitor_key):
+    """Analyse one webcam frame for one student.
 
+    Returns a stats dict. `warnings` is the list of independent malpractice
+    EVENTS active right now (phone, other person, no face, plus at most ONE
+    attention warning such as head turned / eyes away / mouth open), so one
+    physical action never costs several strikes at once.
+    """
     state = _get_monitor_state(monitor_key)
 
     with state["lock"]:
-
         height, width = frame.shape[:2]
+        if width > ANALYSIS_MAX_WIDTH:
+            scale = ANALYSIS_MAX_WIDTH / float(width)
+            frame = cv2.resize(frame, (ANALYSIS_MAX_WIDTH, max(1, int(height * scale))),
+                               interpolation=cv2.INTER_AREA)
+            height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        phone_detected = False
-
-        rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
-
+        # Lighting check (cheap): average brightness of the whole frame.
+        brightness = float(cv2.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))[0])
+        dim_confirmed = _hist_confirm(state["dim_hist"], brightness < DIM_MEAN_THRESHOLD, DIM_NEED)
 
         results = state["face_mesh"].process(rgb)
-
-
         state["total_frames"] += 1
+        state["frame_no"] += 1
 
+        mesh_faces = list(results.multi_face_landmarks or [])
+        mesh_count = len(mesh_faces)
+        detector_count = count_faces_detector(rgb)
+        face_count = max(mesh_count, detector_count)
 
-        # =====================================================
-        # NO FACE
-        # =====================================================
+        # The phone model is the heaviest step: run it on every second frame
+        # and reuse the answer in between (a phone stays in view for seconds).
+        if state["frame_no"] % 2 == 1:
+            phone_found, phone_score = detect_phone_in_frame(frame)
+            state["last_phone_found"] = phone_found
+            state["last_phone_score"] = phone_score
+        else:
+            phone_found, phone_score = state["last_phone_found"], state["last_phone_score"]
+        phone_confirmed = _hist_confirm(state["phone_hist"], phone_found, PHONE_NEED)
+        multi_confirmed = _hist_confirm(state["multi_hist"], face_count >= 2, MULTI_NEED)
 
-        if not results.multi_face_landmarks:
+        # How long has NOBODY been in front of the camera?
+        now_ts = time.time()
+        if mesh_count == 0 and detector_count == 0:
+            if state["no_face_since"] is None:
+                state["no_face_since"] = now_ts
+            absent_seconds = now_ts - state["no_face_since"]
+        else:
+            state["no_face_since"] = None
+            absent_seconds = 0.0
+        must_terminate = absent_seconds >= NO_FACE_END_SECONDS
 
-            state["no_face_frames"] += 1
-            no_face_confirmed = state["no_face_frames"] >= NO_FACE_FRAME_CHECK
+        events = []
+        if dim_confirmed:
+            events.append(("lighting_warning",
+                           "The room is too dark. Please turn on a light so your face is clearly visible."))
+        if phone_confirmed:
+            events.append(("phone_warning", "Mobile phone detected. Please remove it."))
+        if multi_confirmed:
+            events.append(("multiple_face_warning",
+                           "Other person detected. Only the student should be visible."))
 
-            state["latest_stats"] = {
-
-                "ear": 0,
-
-                "mar": 0,
-
-                "closure": 0,
-
-                "blink_rate": 0,
-
-                "yaw": 0,
-
-                "pitch": 0,
-
-                "roll": 0,
-
-                "face_count": 0,
-
-                "status": "No Face",
-
-                "eyes": "Unknown",
-
-                "mouth": "Unknown",
-
-                "looking": "Unknown",
-
-                "head_pose": "Unknown",
-
-                "eye_gaze": "Unknown",
-
-                "gaze_ratio": 0.5,
-
-                "warning": no_face_confirmed,
-
-                "warning_message": (
-                    (
-                        "Mobile phone detected. Please remove it."
-                        if phone_detected else
-                        "Face not detected. Please look at the camera."
-                    )
-                    if no_face_confirmed else ""
-                )
-            }
-
-            return state["latest_stats"]
-
+        # ---------------------------------------------------------------
+        # No FaceMesh face at all
+        # ---------------------------------------------------------------
+        if mesh_count == 0:
+            if detector_count >= 1:
+                # A face is there but too turned/tilted for FaceMesh to lock
+                # on: that is a head-direction problem, not a missing student.
+                state["no_face_frames"] = 0
+                turned = _hist_confirm(state["turned_hist"], True, HEAD_POSE_NEED)
+                if turned and not events:
+                    events.append(("head_direction_warning",
+                                   "Please look straight at the camera."))
+                stats = _blank_stats(face_count, "Warning" if events else "Normal", events)
+                stats["looking"] = "Turned away"
+            else:
+                state["turned_hist"].append(False)
+                state["no_face_frames"] += 1
+                if state["no_face_frames"] >= NO_FACE_FRAME_CHECK and not dim_confirmed:
+                    left = max(0, int(NO_FACE_END_SECONDS - absent_seconds))
+                    events.append(("no_face_warning",
+                                   f"Face not detected. Please look at the camera. "
+                                   f"The exam ends automatically in {left} s if you do not return."))
+                stats = _blank_stats(0, "No Face" if not events else "Warning", events)
+            stats["phone_score"] = round(phone_score, 3)
+            stats["brightness"] = round(brightness, 1)
+            stats["no_face_seconds"] = round(absent_seconds, 1)
+            if must_terminate:
+                stats["terminate"] = True
+                stats["terminate_reason"] = "no_face_timeout"
+                stats["warning"] = True
+                stats["warning_message"] = "Your face was not visible for too long. The exam is being ended."
+            stats["calibrated"] = state["baseline"] is not None
+            state["latest_stats"] = stats
+            return stats
 
         state["no_face_frames"] = 0
-        state["multiple_face_frames"] = 0
+        state["turned_hist"].append(False)
 
-        face_count = len(
-            results.multi_face_landmarks
-        )
+        # ---------------------------------------------------------------
+        # Primary face = the largest one (the student sitting at the camera)
+        # ---------------------------------------------------------------
+        primary = max(mesh_faces, key=lambda f: _face_area(f.landmark))
+        face_landmarks = primary.landmark
 
-        if face_count == 1 and PHONE_DETECTION_AVAILABLE:
-            phone_detected = detect_phone_in_frame(frame)
-        if phone_detected:
-            state["phone_bad_frames"] += 1
-        else:
-            state["phone_bad_frames"] = 0
-        phone_confirmed = state["phone_bad_frames"] >= PHONE_FRAME_CHECK
-
-        # =====================================================
-        # MULTIPLE FACES
-        # =====================================================
-
-        if face_count > 1:
-
-            state["multiple_face_frames"] += 1
-            state["yaw_bad_frames"] = 0
-            state["pitch_bad_frames"] = 0
-            state["roll_bad_frames"] = 0
-
-            multiple_faces_confirmed = (
-                state["multiple_face_frames"] >= MULTIPLE_FACE_FRAME_CHECK
-            )
-
-            state["latest_stats"]["face_count"] = face_count
-            state["latest_stats"]["status"] = "Multiple Faces"
-            state["latest_stats"]["warning"] = multiple_faces_confirmed
-            state["latest_stats"]["warning_message"] = (
-                "Other person detected. Only the student should be visible."
-                if multiple_faces_confirmed else ""
-            )
-
-            return state["latest_stats"]
-
-
-        # =====================================================
-        # SINGLE FACE
-        # =====================================================
-
-        face_landmarks = (
-            results.multi_face_landmarks[0]
-            .landmark
-        )
-
-        # =====================================================
-        # EAR
-        # =====================================================
-
-        left_ear = calculate_ear(
-            face_landmarks,
-            LEFT_EYE,
-            width,
-            height
-        )
-
-
-        right_ear = calculate_ear(
-            face_landmarks,
-            RIGHT_EYE,
-            width,
-            height
-        )
-
-
-        ear = (
-            left_ear + right_ear
-        ) / 2.0
-
-
+        left_ear = calculate_ear(face_landmarks, LEFT_EYE, width, height)
+        right_ear = calculate_ear(face_landmarks, RIGHT_EYE, width, height)
+        ear = (left_ear + right_ear) / 2.0
         state["ear_history"].append(ear)
 
-
-        # =====================================================
-        # EYE STATUS
-        # =====================================================
-
-        eyes_closed = (
-            ear < EAR_THRESHOLD
-        )
-
-
+        eyes_closed = ear < EAR_THRESHOLD
         if eyes_closed:
-
             state["eye_closed_frames"] += 1
-
             eyes_status = "Closed"
-
         else:
-
             state["eye_closed_frames"] = 0
-
             eyes_status = "Open"
 
-
-        # =====================================================
-        # BLINK DETECTION
-        # =====================================================
-
         ear_history = state["ear_history"]
-
         if len(ear_history) >= 2:
-
-            previous_ear = ear_history[-2]
-
-
-            if (
-                previous_ear < EAR_THRESHOLD
-                and ear >= EAR_THRESHOLD
-            ):
-
+            if ear_history[-2] < EAR_THRESHOLD and ear >= EAR_THRESHOLD:
                 current_time = time.time()
-
-
-                # Avoid duplicate blink counting
                 if current_time - state["last_blink_time"] > 0.15:
-
                     state["blink_count"] += 1
-
-                    state["blink_times"].append(
-                        current_time
-                    )
-
+                    state["blink_times"].append(current_time)
                     state["last_blink_time"] = current_time
 
-
-        # =====================================================
-        # BLINK RATE
-        # =====================================================
-
         current_time = time.time()
-
         blink_times = state["blink_times"]
-
-        while (
-            blink_times
-            and current_time - blink_times[0] > 60
-        ):
-
+        while blink_times and current_time - blink_times[0] > 60:
             blink_times.popleft()
+        blink_rate = len(blink_times)
 
-
-        blink_rate = len(
-            blink_times
+        closure_percentage = (
+            state["eye_closed_frames"] / state["total_frames"] * 100
+            if state["total_frames"] > 0 else 0
         )
 
+        mar = calculate_mar(face_landmarks, width, height)
+        mouth_open_now = mar > MAR_THRESHOLD
+        mouth_status = "Open" if mouth_open_now else "Normal"
+        mouth_confirmed = _hist_confirm(state["mouth_hist"], mouth_open_now, MOUTH_NEED)
 
-        # =====================================================
-        # EYE CLOSURE %
-        # =====================================================
+        # Eye gaze (iris position inside the eye), both axes.
+        gaze_h = (
+            calculate_gaze_ratio(face_landmarks, (LEFT_EYE[0], LEFT_EYE[3]), LEFT_IRIS_CENTER, width)
+            + calculate_gaze_ratio(face_landmarks, (RIGHT_EYE[0], RIGHT_EYE[3]), RIGHT_IRIS_CENTER, width)
+        ) / 2.0
+        gaze_v = (
+            calculate_vertical_gaze_ratio(face_landmarks, LEFT_EYE_TOP, LEFT_EYE_BOTTOM, LEFT_IRIS_CENTER, height)
+            + calculate_vertical_gaze_ratio(face_landmarks, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM, RIGHT_IRIS_CENTER, height)
+        ) / 2.0
+        gaze_ratio = (gaze_h + gaze_v) / 2.0
 
-        if state["total_frames"] > 0:
+        pitch, yaw, roll = calculate_head_pose(face_landmarks, width, height)
 
-            closure_percentage = (
-                state["eye_closed_frames"]
-                / state["total_frames"]
-            ) * 100
+        # ---------------------------------------------------------------
+        # Per-student baseline (calm, facing the screen)
+        # ---------------------------------------------------------------
+        baseline = state["baseline"]
+        if baseline is None and mesh_count == 1 and not eyes_closed:
+            any_c = state["calib_any"]
+            for key, val in (("yaw", yaw), ("pitch", pitch), ("roll", roll), ("gh", gaze_h), ("gv", gaze_v)):
+                any_c[key].append(val)
+                del any_c[key][:-40]
+            if state["total_frames"] >= CALIBRATION_FALLBACK_FRAMES and len(any_c["yaw"]) >= 8:
+                state["baseline"] = baseline = {k: _median(any_c[k]) for k in ("yaw", "pitch", "roll", "gh", "gv")}
+        if baseline is None:
+            calm = (
+                mesh_count == 1 and not eyes_closed
+                and abs(yaw) < 30 and abs(pitch) < 35 and abs(roll) < 30
+            )
+            if calm:
+                calib = state["calib"]
+                calib["yaw"].append(yaw)
+                calib["pitch"].append(pitch)
+                calib["roll"].append(roll)
+                calib["gh"].append(gaze_h)
+                calib["gv"].append(gaze_v)
+                if len(calib["yaw"]) >= CALIBRATION_FRAMES:
+                    state["baseline"] = baseline = {
+                        "yaw": _median(calib["yaw"]),
+                        "pitch": _median(calib["pitch"]),
+                        "roll": _median(calib["roll"]),
+                        "gh": _median(calib["gh"]),
+                        "gv": _median(calib["gv"]),
+                    }
+        calibrated = baseline is not None
+        base = baseline or {"yaw": 0.0, "pitch": 0.0, "roll": 0.0, "gh": 0.5, "gv": 0.5}
 
+        d_yaw = yaw - base["yaw"]
+        d_pitch = pitch - base["pitch"]
+        d_roll = roll - base["roll"]
+        d_gh = gaze_h - base["gh"]
+        d_gv = gaze_v - base["gv"]
+
+        if d_yaw >= YAW_THRESHOLD:
+            looking = "Looking Right"
+        elif d_yaw <= -YAW_THRESHOLD:
+            looking = "Looking Left"
         else:
+            looking = "Looking Center"
 
-            closure_percentage = 0
-
-
-        # =====================================================
-        # MAR
-        # =====================================================
-
-        mar = calculate_mar(
-            face_landmarks,
-            width,
-            height
-        )
-
-
-        if mar > MAR_THRESHOLD:
-
-            mouth_status = "Open"
-
-            state["mouth_open_frames"] += 1
-
+        if abs(d_roll) >= ROLL_THRESHOLD:
+            head_pose = "Head Tilted"
+        elif d_pitch >= PITCH_THRESHOLD:
+            head_pose = "Looking Down"
+        elif d_pitch <= -PITCH_THRESHOLD:
+            head_pose = "Looking Up"
         else:
+            head_pose = "Normal"
 
-            mouth_status = "Normal"
-
-            state["mouth_open_frames"] = 0
-
-
-        # =====================================================
-        # EYE GAZE (where the pupils are pointing — independent
-        # of head rotation, using the iris landmarks unlocked by
-        # refine_landmarks=True). Checks BOTH axes: left/right AND
-        # up/down, not just horizontal.
-        # =====================================================
-
-        left_gaze_ratio_h = calculate_gaze_ratio(
-            face_landmarks,
-            (LEFT_EYE[0], LEFT_EYE[3]),
-            LEFT_IRIS_CENTER,
-            width
-        )
-
-        right_gaze_ratio_h = calculate_gaze_ratio(
-            face_landmarks,
-            (RIGHT_EYE[0], RIGHT_EYE[3]),
-            RIGHT_IRIS_CENTER,
-            width
-        )
-
-        gaze_ratio_h = (left_gaze_ratio_h + right_gaze_ratio_h) / 2.0
-
-        left_gaze_ratio_v = calculate_vertical_gaze_ratio(
-            face_landmarks,
-            LEFT_EYE_TOP,
-            LEFT_EYE_BOTTOM,
-            LEFT_IRIS_CENTER,
-            height
-        )
-
-        right_gaze_ratio_v = calculate_vertical_gaze_ratio(
-            face_landmarks,
-            RIGHT_EYE_TOP,
-            RIGHT_EYE_BOTTOM,
-            RIGHT_IRIS_CENTER,
-            height
-        )
-
-        gaze_ratio_v = (left_gaze_ratio_v + right_gaze_ratio_v) / 2.0
-        # Combined gaze value used by the stats payload.
-        gaze_ratio = (gaze_ratio_h + gaze_ratio_v) / 2.0
-
-        horizontal_label = None
-
-        if gaze_ratio_h < (0.5 - GAZE_THRESHOLD_H):
-            horizontal_label = "Left"
-        elif gaze_ratio_h > (0.5 + GAZE_THRESHOLD_H):
-            horizontal_label = "Right"
-
-        vertical_label = None
-
-        if gaze_ratio_v < (0.5 - GAZE_THRESHOLD_V):
-            vertical_label = "Up"
-        elif gaze_ratio_v > (0.5 + GAZE_THRESHOLD_V):
-            vertical_label = "Down"
-
+        horizontal_label = "Left" if d_gh < -GAZE_THRESHOLD_H else ("Right" if d_gh > GAZE_THRESHOLD_H else None)
+        vertical_label = "Up" if d_gv < -GAZE_THRESHOLD_V else ("Down" if d_gv > GAZE_THRESHOLD_V else None)
         if vertical_label and horizontal_label:
             eye_gaze = f"Eyes {vertical_label}-{horizontal_label}"
         elif vertical_label:
@@ -1327,215 +1703,71 @@ def analyze_face_frame(frame, monitor_key):
         else:
             eye_gaze = "Eyes Center"
 
+        # Windows are always advanced (so they stay in step with real time),
+        # but warnings are only produced once the baseline exists.
+        yaw_confirmed = _hist_confirm(state["yaw_hist"], calibrated and abs(d_yaw) >= YAW_THRESHOLD, HEAD_POSE_NEED)
+        pitch_confirmed = _hist_confirm(state["pitch_hist"], calibrated and abs(d_pitch) >= PITCH_THRESHOLD, HEAD_POSE_NEED)
+        roll_confirmed = _hist_confirm(state["roll_hist"], calibrated and abs(d_roll) >= ROLL_THRESHOLD, HEAD_POSE_NEED)
+        gaze_confirmed = _hist_confirm(
+            state["gaze_hist"],
+            calibrated and eye_gaze != "Eyes Center" and not eyes_closed,
+            GAZE_NEED,
+        )
 
-        gaze_off_center = (eye_gaze != "Eyes Center")
-
-        if gaze_off_center and not eyes_closed:
-
-            state["gaze_off_frames"] += 1
-
-        else:
-
-            state["gaze_off_frames"] = 0
-
-
-        # =====================================================
-        # HEAD POSE
-        # =====================================================
-
-
-        pitch, yaw, roll = calculate_head_pose(face_landmarks,width,height)
-
-        # =====================================================
-        # LOOKING DIRECTION
-        # =====================================================
-
-        if yaw >= YAW_THRESHOLD:
-
-            looking = "Looking Right"
-
-        elif yaw <= -YAW_THRESHOLD:
-
-            looking = "Looking Left"
-
-        else:
-
-            looking = "Looking Center"
-
-
-        # =====================================================
-        # HEAD TILT
-        # =====================================================
-
-        if abs(roll) >= ROLL_THRESHOLD:
-            head_pose = "Head Tilted"
-        elif pitch >= PITCH_THRESHOLD:
-            head_pose = "Looking Down"
-        elif pitch <= -PITCH_THRESHOLD:
-            head_pose = "Looking Up"
-        else:
-            head_pose = "Normal"
-
-        # Debounce head-pose warnings. A student can naturally cross a
-        # threshold for one or two frames while reading or moving.
-        state["yaw_bad_frames"] = state["yaw_bad_frames"] + 1 if abs(yaw) >= YAW_THRESHOLD else 0
-        state["pitch_bad_frames"] = state["pitch_bad_frames"] + 1 if abs(pitch) >= PITCH_THRESHOLD else 0
-        state["roll_bad_frames"] = state["roll_bad_frames"] + 1 if abs(roll) >= ROLL_THRESHOLD else 0
-
-        yaw_confirmed = state["yaw_bad_frames"] >= HEAD_POSE_FRAME_CHECK
-        pitch_confirmed = state["pitch_bad_frames"] >= HEAD_POSE_FRAME_CHECK
-        roll_confirmed = state["roll_bad_frames"] >= HEAD_POSE_FRAME_CHECK
-
-        # =====================================================
-        # WARNING LOGIC
-        # =====================================================
-
-        warning = False
-
-        warning_message = ""
-
-
-        if phone_confirmed:
-
-            warning = True
-
-            warning_message = (
-                "Mobile phone detected. Please remove it."
-            )
-
-
-        elif yaw_confirmed:
-
-            warning = True
-
-            warning_message = (
-                "Please look straight at the camera."
-            )
-
-
+        # ONE attention warning at a time, in priority order.
+        attention = None
+        if yaw_confirmed:
+            attention = ("head_direction_warning", "Please look straight at the camera.")
         elif pitch_confirmed:
-
-            warning = True
-
-            warning_message = (
-                "Please keep your face straight."
-            )
-
-
+            attention = ("head_pitch_warning", "Please keep your face straight.")
         elif roll_confirmed:
-
-            warning = True
-
-            warning_message = (
-                "Please keep your head straight."
-            )
-
-
+            attention = ("head_roll_warning", "Please keep your head straight.")
         elif state["eye_closed_frames"] >= FRAME_CHECK:
+            attention = ("eyes_closed_warning", "Eyes closed for too long. Please stay attentive.")
+        elif gaze_confirmed:
+            attention = ("gaze_warning",
+                         f"Eyes are not looking at the screen ({eye_gaze}). Please look straight at your screen.")
+        elif mouth_confirmed:
+            attention = ("mouth_warning",
+                         "Mouth movement detected. Please avoid talking during the examination.")
+        # A phone / second person already explains looking away: one action,
+        # one strike.
+        if attention and not events:
+            events.append(attention)
 
-            warning = True
-
-            warning_message = (
-                "Eyes closed for too long. "
-                "Please stay attentive."
-            )
-
-
-        elif state["gaze_off_frames"] >= GAZE_FRAME_CHECK:
-
-            warning = True
-
-            warning_message = (
-                f"Eyes are not looking at the screen ({eye_gaze}). "
-                "Please look straight at your screen."
-            )
-
-
-        # FIX: this used to fire on state["mouth_open_frames"] >= 1 —
-        # a single frame of a slightly-open mouth (yawning, adjusting
-        # a mask, a brief word to a proctor) instantly counted as a
-        # warning, with no debounce at all unlike every other check
-        # here. Now requires the same sustained FRAME_CHECK run as
-        # eyes/gaze/head-pose before it's treated as real talking.
-        elif state["mouth_open_frames"] >= FRAME_CHECK:
-
-            warning = True
-
-            warning_message = (
-                "Mouth movement detected. "
-                "Please avoid talking during the examination."
-            )
-
-
-        # =====================================================
-        # STATUS
-        # =====================================================
-
-        if warning:
-
-            status = "Warning"
-
-        else:
-
-            status = "Normal"
-
+        warning = bool(events)
+        top = events[0] if events else None
 
         state["latest_stats"] = {
-
             "ear": round(ear, 3),
-
             "mar": round(mar, 3),
-
-            "closure": round(
-                closure_percentage,
-                2
-            ),
-
+            "closure": round(closure_percentage, 2),
             "blink_rate": blink_rate,
-
             "blink_count": state["blink_count"],
-
             "yaw": round(yaw, 2),
-
             "pitch": round(pitch, 2),
-
             "roll": round(roll, 2),
-
+            "d_yaw": round(d_yaw, 2),
+            "d_pitch": round(d_pitch, 2),
+            "d_roll": round(d_roll, 2),
             "face_count": face_count,
-
-            "status": status,
-
+            "status": "Warning" if warning else "Normal",
             "eyes": eyes_status,
-
             "mouth": mouth_status,
-
             "looking": looking,
-
             "head_pose": head_pose,
-
             "eye_gaze": eye_gaze,
-
             "gaze_ratio": round(gaze_ratio, 3),
-
+            "phone_score": round(phone_score, 3),
+            "brightness": round(brightness, 1),
+            "no_face_seconds": 0,
+            "calibrated": calibrated,
             "warning": warning,
-
-            "warning_message": warning_message
+            "warning_message": top[1] if top else "",
+            "warning_type": top[0] if top else "",
+            "warnings": [{"type": t, "message": m} for t, m in events],
         }
-
-
         return state["latest_stats"]
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ============================================================
@@ -1857,7 +2089,7 @@ def log_violation_to_sheet(student_id, exam_id, violation_type, message):
             sheet = workbook["Violations"]
 
         sheet.append([
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            _now_local().strftime("%Y-%m-%d %H:%M:%S"),
             student_id,
             exam_id,
             violation_type,
@@ -2056,40 +2288,167 @@ def student_login():
 
 
 
+def _results_attempts(workbook, student_id):
+    """Return {exam_id: exam_status} for every result this student has.
+
+    Looks columns up by header name so it works with old and new
+    database.xlsx layouts (Exam ID has moved between versions).
+    """
+    attempts = {}
+    if "Results" not in workbook.sheetnames:
+        return attempts
+    ws = workbook["Results"]
+    headers = [str(c.value or "").strip() for c in ws[1]]
+
+    def col(name, default):
+        return headers.index(name) if name in headers else default
+
+    i_student = col("Student ID", 1)
+    i_exam = col("Exam ID", 3)
+    i_status = col("Exam Status", 12)
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if len(row) <= max(i_student, i_exam):
+            continue
+        if str(row[i_student] or "").strip() != str(student_id or "").strip():
+            continue
+        status = row[i_status] if len(row) > i_status and row[i_status] else "Completed"
+        attempts[str(row[i_exam] or "").strip()] = str(status)
+    return attempts
+
+
+def _parse_exam_datetime(raw_value):
+    """Accept datetime objects or the common string formats (incl. 'T')."""
+    if isinstance(raw_value, datetime):
+        return raw_value
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    raw_value = raw_value.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(raw_value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+
+@app.route("/student/exams/version")
+@student_login_required
+def student_exams_version():
+    """Tiny poll target: the number changes the moment a teacher adds, edits or
+    removes an exam, so the dashboard can refresh itself immediately."""
+    resp = jsonify({"version": eg_exams_version()})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/internal/sync/exams", methods=["POST"])
+def internal_sync_exams():
+    """Local (non-Neon) mode: the admin service pushes the full Exams sheet."""
+    import hmac as _hmac
+    token = str(request.headers.get("X-ExamGuard-Sync-Token", ""))
+    if not ADMIN_SYNC_TOKEN or not _hmac.compare_digest(token, ADMIN_SYNC_TOKEN):
+        return jsonify({"success": False, "error": "Unauthorized exam sync"}), 401
+    if _eg_use_neon():
+        return jsonify({"success": True, "shared": True})
+    try:
+        payload = request.get_json(silent=True) or {}
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            return jsonify({"success": False, "error": "rows missing"}), 400
+
+        def norm(r):
+            t = tuple(r)
+            end = len(t)
+            while end > 0 and t[end - 1] in (None, ""):
+                end -= 1
+            return t[:end]
+
+        incoming = [norm(r) for r in rows]
+        wb = load_database()
+        try:
+            ws = wb["Exams"]
+            current = [norm(r) for r in ws.iter_rows(min_row=2, values_only=True)
+                       if r and r[0] not in (None, "")]
+            if current == incoming:
+                return jsonify({"success": True, "changed": False})
+            if ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
+            for r in rows:
+                ws.append(list(r))
+            save_database(wb)
+        finally:
+            wb.close()
+        _EG_LOCAL_EXAMS_VERSION["v"] += 1
+        print(f"[EXAM-SYNC] Exams updated from admin ({len(rows)} rows)")
+        return jsonify({"success": True, "changed": True})
+    except Exception as exc:
+        print("[EXAM-SYNC] failed:", exc)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
 @app.route("/student/dashboard")
 @student_login_required
 def student_dashboard():
+    student_id = session.get("student_id", "")
 
+    # A student who reaches the dashboard has left the exam; make sure a
+    # stale "locked" flag from a previous attempt cannot trap them here once
+    # the keyboard was legitimately unlocked.
     workbook = load_database()
-
-    sheet = workbook["Exams"]
-
-    subjects = {}
-
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-
-        exam_id = row[0]
-        subject_name = row[3]
-        subject_code = row[4]
-        teacher_name = row[2]
-
-        if exam_id not in subjects:
-
-            subjects[exam_id] = {
+    try:
+        sheet = workbook["Exams"]
+        attempts = _results_attempts(workbook, student_id)
+        exams = {}
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            exam_id = row[0]
+            if exam_id in (None, "") or exam_id in exams:
+                continue
+            exams[exam_id] = {
                 "exam_id": exam_id,
-                "subject_name": subject_name,
-                "subject_code": subject_code,
-                "teacher_name": teacher_name
+                "subject_name": row[3],
+                "subject_code": row[4],
+                "teacher_name": row[2],
+                "from_raw": row[12] if len(row) > 12 else None,
+                "until_raw": row[13] if len(row) > 13 else None,
+                "duration": row[14] if len(row) > 14 else None,
             }
+    finally:
+        workbook.close()
 
-    workbook.close()
+    now = _now_local()
+    subject_list = []
+    for exam in exams.values():
+        opens_at = _parse_exam_datetime(exam.pop("from_raw"))
+        closes_at = _parse_exam_datetime(exam.pop("until_raw"))
+        exam.pop("duration", None)
+        attempt = attempts.get(str(exam["exam_id"]).strip())
 
-    subject_list = list(subjects.values())
+        exam.update({
+            "state": "live", "countdown_seconds": 0, "opens_at_label": "",
+            "closes_at_label": "", "attempt_status": attempt or "",
+            # backwards-compatible flags for older templates
+            "finished": False, "expired": False, "countdown_target": "",
+        })
+        if opens_at:
+            exam["opens_at_label"] = opens_at.strftime("%d %b %Y, %I:%M %p")
+        if closes_at:
+            exam["closes_at_label"] = closes_at.strftime("%d %b %Y, %I:%M %p")
 
-    return render_template(
-        "student_dashboard.html",
-        subjects=subject_list
-    )
+        if attempt is not None:
+            # "Completed" = submitted normally (blue); anything else = ended by
+            # a violation / timeout (red "Finished").
+            exam["state"] = "completed" if attempt == "Completed" else "finished"
+            exam["finished"] = exam["state"] == "finished"
+        elif opens_at and now < opens_at:
+            exam["state"] = "upcoming"
+            exam["countdown_seconds"] = max(0, int((opens_at - now).total_seconds()))
+        elif closes_at and now > closes_at:
+            exam["state"] = "closed"
+            exam["expired"] = True
+        subject_list.append(exam)
+
+    return render_template("student_dashboard.html", subjects=subject_list, exams_version=eg_exams_version())
 
 
 # ============================================================
@@ -2179,7 +2538,7 @@ def _post_recording_to_admin(path,exam_id,student_id,filename):
     if not ADMIN_SYNC_TOKEN or ADMIN_SYNC_TOKEN=="CHANGE_THIS_SHARED_RECORDING_SYNC_TOKEN": return False
     try:
         with open(path,"rb") as fh:
-            r=requests.post(f"{ADMIN_SYNC_BASE_URL}/internal/sync/recording",headers={"X-ExamGuard-Sync-Token":ADMIN_SYNC_TOKEN},data={"exam_id":str(exam_id),"student_id":str(student_id),"filename":_safe_admin_filename(filename)},files={"recording":(filename,fh,"video/webm")},timeout=(8,180),verify=ADMIN_SYNC_VERIFY_SSL)
+            r=requests.post(f"{ADMIN_SYNC_BASE_URL}/internal/sync/recording",headers={"X-ExamGuard-Sync-Token":ADMIN_SYNC_TOKEN},data={"exam_id":str(exam_id),"student_id":str(student_id),"filename":_safe_admin_filename(filename)},files={"recording":(filename,fh,"video/webm")},timeout=(10,300),verify=ADMIN_SYNC_VERIFY_SSL)
         return bool(r.ok and (r.json() if r.content else {}).get("success"))
     except Exception as e:
         print("[SYNC] recording upload:",e); return False
@@ -2212,6 +2571,12 @@ def _post_recording_chunk_to_admin(path, exam_id, student_id, filename, token, s
         return False
 
 
+# Live forwarding: every 2-second chunk is passed on to the admin server while
+# the exam is still running, so nothing big is left to upload at the end.
+FWD_STATE = {}
+FWD_STATE_LOCK = threading.Lock()
+FWD_FOLDER = os.path.join(RECORDINGS_FOLDER, ".examguard_fwd")
+os.makedirs(FWD_FOLDER, exist_ok=True)
 RECORDING_CHUNK_SYNC_QUEUE = __import__('queue').Queue()
 RECORDING_CHUNK_SYNC_THREAD_STARTED = False
 RECORDING_CHUNK_SYNC_START_LOCK = threading.Lock()
@@ -2227,11 +2592,19 @@ def _recording_chunk_sync_worker():
         try:
             ok = False
             for attempt in range(1, 8):
+                if not os.path.isfile(path):
+                    ok = True            # already delivered earlier
+                    break
                 if _post_recording_chunk_to_admin(path, exam_id, student_id, filename, token, seq):
                     ok = True
                     break
-                time.sleep(min(8, attempt))
-            if not ok:
+                time.sleep(min(4, attempt))
+            if ok:
+                try: os.remove(path)
+                except OSError: pass
+                with FWD_STATE_LOCK:
+                    FWD_STATE.setdefault(token, {"queued": set(), "sent": set()})["sent"].add(int(seq))
+            else:
                 print(f"[SYNC] Recording chunk remains queued: {token}:{seq}")
         finally:
             RECORDING_CHUNK_SYNC_QUEUE.task_done()
@@ -2241,7 +2614,7 @@ def _start_recording_chunk_sync_worker():
     global RECORDING_CHUNK_SYNC_THREAD_STARTED
     with RECORDING_CHUNK_SYNC_START_LOCK:
         if not RECORDING_CHUNK_SYNC_THREAD_STARTED:
-            for i in range(3):
+            for i in range(4):
                 threading.Thread(target=_recording_chunk_sync_worker, daemon=True, name=f"recording-sync-{i+1}").start()
             RECORDING_CHUNK_SYNC_THREAD_STARTED = True
 
@@ -2289,37 +2662,77 @@ def _queue_recording_finalize_for_admin(exam_id, student_id, filename, token, ex
     threading.Thread(target=worker, daemon=True, name="recording-finalize-sync").start()
 
 
-def _queue_recording_for_admin(path,exam_id,student_id,filename,try_immediately=True):
+RECORDING_STATUS = {}
+RECORDING_STATUS_LOCK = threading.Lock()
+RECORDING_PUSH_RUNNING = set()
+RECORDING_READY_FALLBACK_SECONDS = int(os.environ.get("RECORDING_READY_FALLBACK_SECONDS", "25"))
+
+
+def _rec_key(student_id, exam_id):
+    return f"{student_id}:{exam_id}"
+
+
+def _rec_status_set(student_id, exam_id, state, detail=""):
+    key = _rec_key(student_id, exam_id)
+    with RECORDING_STATUS_LOCK:
+        cur = RECORDING_STATUS.setdefault(key, {"started_at": time.time()})
+        cur.update({"state": state, "detail": detail, "updated_at": time.time()})
+
+
+def _rec_status_get(student_id, exam_id):
+    with RECORDING_STATUS_LOCK:
+        return dict(RECORDING_STATUS.get(_rec_key(student_id, exam_id), {}))
+
+
+def _recording_ready(student_id, exam_id):
+    """True when the keyboard may be unlocked: the recording reached the admin,
+    there is no recording to wait for, or it has been retrying for a long time
+    (the background thread keeps going either way)."""
+    st = _rec_status_get(student_id, exam_id)
+    if not st:
+        return True
+    if st.get("state") in ("done", "none", "failed"):
+        return True
+    return (time.time() - st.get("started_at", time.time())) > RECORDING_READY_FALLBACK_SECONDS
+
+
+def _queue_recording_for_admin(path,exam_id,student_id,filename,try_immediately=False):
+    """Push the assembled recording to the admin server in the background.
+
+    Never blocks the student: a worker thread retries with back-off for
+    several minutes (the admin service on Render may be cold-starting), and a
+    marker file lets it resume after a restart.
+    """
     if not path or not os.path.isfile(path): return
     filename=_safe_admin_filename(filename); marker=os.path.join(ADMIN_SYNC_FOLDER,filename+".json")
     try:
         with open(marker,"w",encoding="utf-8") as fh: json.dump({"path":path,"exam_id":str(exam_id),"student_id":str(student_id),"filename":filename},fh)
     except Exception as e: print("[SYNC] recording queue:",e)
 
-    # FIX: previously this only ever synced to admin on a background
-    # thread with the first attempt starting after some delay — the
-    # video could sit unsynced for a while, and if the student's
-    # computer/app was shut down soon after they saw their results,
-    # it might never get there at all. Since the request that calls
-    # this (finalize) is a good moment to actually wait a few seconds
-    # for it, try once, right now, before falling back to the same
-    # durable background retry queue as before for resilience against
-    # a slow/flaky connection.
-    if try_immediately and _post_recording_to_admin(path,exam_id,student_id,filename):
-        try: os.remove(marker)
-        except OSError: pass
-        print("[SYNC] Recording synced to admin immediately:",filename)
-        return
+    run_key = filename
+    with RECORDING_STATUS_LOCK:
+        if run_key in RECORDING_PUSH_RUNNING:
+            return
+        RECORDING_PUSH_RUNNING.add(run_key)
+    _rec_status_set(student_id, exam_id, "uploading", "Sending the recording to the examiner.")
 
     def worker():
-        for attempt in range(1,13):
-            if _post_recording_to_admin(path,exam_id,student_id,filename):
-                try: os.remove(marker)
-                except OSError: pass
-                print("[SYNC] Recording synced to admin:",filename); return
-            time.sleep(min(10,attempt*2))
-        print("[SYNC] Recording remains queued:",filename)
-    threading.Thread(target=worker,daemon=True).start()
+        try:
+            for attempt in range(1, 61):
+                if _post_recording_to_admin(path,exam_id,student_id,filename):
+                    try: os.remove(marker)
+                    except OSError: pass
+                    _rec_status_set(student_id, exam_id, "done", "Recording uploaded.")
+                    print("[SYNC] Recording synced to admin:",filename)
+                    return
+                _rec_status_set(student_id, exam_id, "uploading", f"Retrying upload (attempt {attempt})...")
+                time.sleep(min(15, 2 + attempt * 2))
+            _rec_status_set(student_id, exam_id, "failed", "Upload will keep retrying in the background.")
+            print("[SYNC] Recording remains queued:",filename)
+        finally:
+            with RECORDING_STATUS_LOCK:
+                RECORDING_PUSH_RUNNING.discard(run_key)
+    threading.Thread(target=worker,daemon=True,name="recording-push").start()
 
 def _queue_result_for_admin(payload):
     if not ADMIN_SYNC_TOKEN or ADMIN_SYNC_TOKEN=="CHANGE_THIS_SHARED_RECORDING_SYNC_TOKEN": return
@@ -2346,7 +2759,37 @@ def _queue_result_for_admin(payload):
 # old JPEGs from piling up when the admin server/network is temporarily slow.
 LIVE_FRAME_SYNC_STATE = {}
 LIVE_FRAME_SYNC_STATE_LOCK = threading.Lock()
-LIVE_FRAME_SYNC_INTERVAL = 0.8
+LIVE_FRAME_SYNC_INTERVAL = 2.0
+
+LIVE_VIOLATION_STATE = {}
+LIVE_VIOLATION_LOCK = threading.Lock()
+_TERMINATION_TYPES = {"max_warnings_reached", "fullscreen_exit", "tab_switch_autoend", "time_expired", "no_face_timeout"}
+
+
+def _note_violation(student_id, exam_id, vtype, message):
+    sid = str(student_id or "")
+    if not sid:
+        return
+    with LIVE_VIOLATION_LOCK:
+        entry = LIVE_VIOLATION_STATE.setdefault(sid, {"count": 0, "last": "", "exam_id": str(exam_id or ""), "terminated": False})
+        if entry.get("exam_id") != str(exam_id or ""):
+            entry.update({"count": 0, "last": "", "exam_id": str(exam_id or ""), "terminated": False})
+        if vtype in _TERMINATION_TYPES:
+            entry["terminated"] = True
+        else:
+            entry["count"] += 1
+        entry["last"] = f"{vtype}: {message}"[:240]
+
+
+def _live_violation_fields(student_id):
+    with LIVE_VIOLATION_LOCK:
+        entry = dict(LIVE_VIOLATION_STATE.get(str(student_id or ""), {}))
+    return {
+        "violation_count": int(entry.get("count", 0)),
+        "last_violation": entry.get("last", ""),
+        "terminated": bool(entry.get("terminated", False)),
+    }
+
 
 def _safe_live_sync_id(value):
     return re.sub(r"[^A-Za-z0-9_-]","_",str(value or ""))[:120] or "student"
@@ -2410,6 +2853,8 @@ def _probe_admin_url(url):
 
 def _get_admin_sync_url():
     global LIVE_ADMIN_URL_CACHE
+    if ADMIN_URL_EXPLICIT:
+        return ADMIN_SYNC_BASE_URL
     with LIVE_ADMIN_URL_LOCK:
         if LIVE_ADMIN_URL_CACHE:
             return LIVE_ADMIN_URL_CACHE
@@ -2461,9 +2906,12 @@ def _post_live_frame_to_admin(frame_path,student_id,payload):
                     "warning":str(bool(payload.get("warning",False))).lower(),
                     "warning_message":str(payload.get("warning_message","")),
                     "student_signal_base_url":str(payload.get("student_signal_base_url", "")),
+                    "violation_count":str(payload.get("violation_count", 0)),
+                    "last_violation":str(payload.get("last_violation", "")),
+                    "terminated":str(bool(payload.get("terminated", False))).lower(),
                 },
                 files={"frame":("live.jpg",fh,"image/jpeg")},
-                timeout=(2,4),
+                timeout=(4,12),
                 verify=ADMIN_SYNC_VERIFY_SSL,
             )
         return bool(r.ok)
@@ -2531,8 +2979,11 @@ def _post_live_heartbeat_to_admin(student_id,payload):
                 "warning":str(bool(payload.get("warning",False))).lower(),
                 "warning_message":str(payload.get("warning_message","")),
                 "student_signal_base_url":str(payload.get("student_signal_base_url", "")),
+                "violation_count":str(payload.get("violation_count", 0)),
+                "last_violation":str(payload.get("last_violation", "")),
+                "terminated":str(bool(payload.get("terminated", False))).lower(),
             },
-            timeout=(1.5,2.5),
+            timeout=(4,10),
             verify=ADMIN_SYNC_VERIFY_SSL,
         )
         return bool(r.ok)
@@ -2582,11 +3033,11 @@ def _post_live_audio_to_admin(audio_path,student_id):
     try:
         with open(audio_path,"rb") as fh:
             r=requests.post(
-                f"{ADMIN_SYNC_BASE_URL}/internal/sync/live-audio",
+                f"{_get_admin_sync_url() or ADMIN_SYNC_BASE_URL}/internal/sync/live-audio",
                 headers={"X-ExamGuard-Sync-Token":LIVE_SYNC_TOKEN},
                 data={"student_id":str(student_id)},
                 files={"audio":("chunk.webm",fh,"audio/webm")},
-                timeout=(2,6),
+                timeout=(4,12),
                 verify=ADMIN_SYNC_VERIFY_SSL,
             )
         return bool(r.ok)
@@ -2607,6 +3058,13 @@ def _retry_pending_admin_syncs():
 def submit_exam(exam_id):
 
     workbook = load_database()
+
+    _already = _results_attempts(workbook, session.get("student_id", "")).get(str(exam_id).strip())
+    if _already is not None:
+        workbook.close()
+        session["kb_locked"] = True
+        session["kb_locked_exam"] = exam_id
+        return _render_exam_done(exam_id, "", _already)
 
     exam_sheet = workbook["Exams"]
 
@@ -2711,6 +3169,7 @@ def submit_exam(exam_id):
         "tab_switch_autoend": "Terminated: Switched Tabs/Window",
         "max_warnings_reached": "Terminated: Maximum Warnings Reached",
         "time_expired": "Time Expired — Auto Submitted",
+        "no_face_timeout": "Terminated: Face Not Visible",
     }
 
     exam_status = TERMINATION_LABELS.get(termination_reason_raw, "Completed")
@@ -2770,7 +3229,7 @@ def submit_exam(exam_id):
     # =========================================================
     result_sheet, details_sheet = _ensure_results_schema(workbook)
 
-    submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    submitted_at = _now_local().strftime("%Y-%m-%d %H:%M:%S")
 
     _append_result_by_header(result_sheet, {
         "Result ID": result_id,
@@ -2883,36 +3342,15 @@ def submit_exam(exam_id):
     })
 
     # =========================================================
-    # DISPLAY RESULT
+    # NO RESULT FOR THE STUDENT - on-screen keyboard unlock page instead
     # =========================================================
-
-    return render_template(
-
-        "student_result.html",
-
-        result_id=result_id,
-
-        exam_id=exam_id,
-
-        subject_name=subject_name,
-
-        subject_code=subject_code,
-
-        questions=result_questions,
-
-        total_questions=total_questions,
-
-        correct_count=correct_count,
-
-        wrong_count=wrong_count,
-
-        unattempted_count=unattempted_count,
-
-        percentage=percentage,
-
-        exam_status=exam_status
-
-    )
+    session["kb_locked"] = True
+    session["kb_locked_exam"] = exam_id
+    if recording_token and not _rec_status_get(session.get("student_id", ""), exam_id):
+        _rec_status_set(session.get("student_id", ""), exam_id, "processing", "Receiving the last part of your exam video.")
+    elif not recording_token and not recording_file:
+        _rec_status_set(session.get("student_id", ""), exam_id, "none", "No recording for this attempt.")
+    return _render_exam_done(exam_id, subject_name, exam_status)
 
 
 
@@ -2989,13 +3427,66 @@ def _assemble_ready_recording_parts(part_dir, meta):
                 shutil.copyfileobj(src, out, length=1024 * 1024)
             next_seq += 1
             meta["next_seq"] = next_seq
-            meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            meta["updated_at"] = _now_local().isoformat(timespec="seconds")
             _save_recording_meta(part_dir, meta)
             try:
                 os.remove(part_path)
             except OSError:
                 pass
         return next_seq, partial_path
+
+
+
+def _deliver_recording_to_admin(final_path, exam_id, student_id, filename, token, expected_last_seq=None):
+    """Hand the finished recording to the admin server.
+
+    Fast path: the chunks were already forwarded live, so only a tiny
+    "assemble" call is needed. If anything is missing it re-sends just those
+    chunks. If that still fails, the complete file is pushed (old behaviour),
+    so a recording is never lost.
+    """
+    key = (str(student_id), str(exam_id))
+    def worker():
+        try:
+            _rec_status_set(student_id, exam_id, "uploading", "Sending the recording to the examiner.")
+            deadline = time.time() + 75
+            fwd_dir = os.path.join(FWD_FOLDER, str(token))
+            while time.time() < deadline:
+                with FWD_STATE_LOCK:
+                    st = FWD_STATE.get(token, {"queued": set(), "sent": set()})
+                    queued, sent = set(st["queued"]), set(st["sent"])
+                last = expected_last_seq if expected_last_seq is not None else (max(queued) if queued else None)
+                if last is None:
+                    break
+                if queued and queued.issubset(sent) and all(i in queued for i in range(0, last + 1)):
+                    break
+                # Chunks the browser uploaded but that were never queued (e.g. after a restart).
+                for i in range(0, last + 1):
+                    fp = os.path.join(fwd_dir, f"{i:08d}.part")
+                    if i not in sent and i not in queued and os.path.isfile(fp):
+                        with FWD_STATE_LOCK:
+                            FWD_STATE.setdefault(token, {"queued": set(), "sent": set()})["queued"].add(i)
+                        _queue_recording_chunk_for_admin(fp, exam_id, student_id, filename, token, i)
+                time.sleep(0.25)
+            last = expected_last_seq
+            if last is None:
+                with FWD_STATE_LOCK:
+                    q = FWD_STATE.get(token, {}).get("queued", set())
+                last = max(q) if q else None
+            if last is not None:
+                for attempt in range(1, 6):
+                    if _post_recording_finalize_to_admin(exam_id, student_id, filename, token, last):
+                        _rec_status_set(student_id, exam_id, "done", "Recording uploaded.")
+                        with FWD_STATE_LOCK:
+                            FWD_STATE.pop(token, None)
+                        shutil.rmtree(fwd_dir, ignore_errors=True)
+                        return
+                    time.sleep(min(3, attempt))
+            print("[SYNC] Live-forwarded recording incomplete; sending the full file instead:", filename)
+        except Exception as exc:
+            print("[SYNC] deliver recording:", exc)
+        _queue_recording_for_admin(final_path, exam_id, student_id, filename)
+    threading.Thread(target=worker, daemon=True, name="recording-deliver").start()
 
 
 @app.route("/student/exam/<exam_id>/upload-recording-chunk", methods=["POST"])
@@ -3039,8 +3530,8 @@ def upload_exam_recording_chunk(exam_id):
                 "exam_id": str(exam_id),
                 "filename": filename,
                 "next_seq": 0,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "created_at": _now_local().isoformat(timespec="seconds"),
+                "updated_at": _now_local().isoformat(timespec="seconds"),
             }
             _save_recording_meta(part_dir, meta)
         elif (str(meta.get("student_id", "")) != str(session.get("student_id", ""))
@@ -3051,8 +3542,27 @@ def upload_exam_recording_chunk(exam_id):
         if not os.path.isfile(part_path):
             with open(part_path, "wb") as out_file:
                 shutil.copyfileobj(video.stream, out_file, length=1024 * 1024)
-        meta["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        meta["updated_at"] = _now_local().isoformat(timespec="seconds")
         _save_recording_meta(part_dir, meta)
+
+        # Pass this chunk on to the admin server right away (background).
+        try:
+            fwd_dir = os.path.join(FWD_FOLDER, token)
+            os.makedirs(fwd_dir, exist_ok=True)
+            fwd_path = os.path.join(fwd_dir, f"{seq:08d}.part")
+            if not os.path.isfile(fwd_path) and os.path.isfile(part_path):
+                shutil.copyfile(part_path, fwd_path)
+            if os.path.isfile(fwd_path):
+                with FWD_STATE_LOCK:
+                    st = FWD_STATE.setdefault(token, {"queued": set(), "sent": set()})
+                    first_time = seq not in st["queued"]
+                    st["queued"].add(seq)
+                if first_time:
+                    _queue_recording_chunk_for_admin(
+                        fwd_path, exam_id, session.get("student_id", ""),
+                        meta.get("filename", ""), token, seq)
+        except Exception as fwd_exc:
+            print("[SYNC] chunk forward skipped:", fwd_exc)
 
         # FIX (real bug — root cause of "sometimes corrupted"): this
         # used to also push every individual chunk to the admin server
@@ -3121,7 +3631,7 @@ def finalize_exam_recording(exam_id):
         # individually-pushed chunks. That pipeline no longer exists
         # (see upload_exam_recording_chunk) — the verified local file
         # below is now the one and only source of the admin's copy.
-        _queue_recording_for_admin(final_path, exam_id, session.get("student_id", ""), filename)
+        _deliver_recording_to_admin(final_path, exam_id, session.get("student_id", ""), filename, token, expected)
         return jsonify({"success":True,"filename":filename})
     except Exception as e:
         print("Recording Finalize Error:",str(e))
@@ -3133,40 +3643,58 @@ def finalize_exam_recording(exam_id):
 def _background_finalize_recording(exam_id, student_id, token, expected_last_seq, wait_seconds=45):
     """Finalize a continuously uploaded recording after result submission.
 
-    This runs outside the student's submit request so the result page is not
-    held up by recording assembly/upload timing.  It waits briefly for the
-    final MediaRecorder chunk(s), then assembles the already-uploaded parts.
+    Runs outside the submit request. It waits briefly for the last chunk(s);
+    if some never arrive it still publishes everything that DID arrive in
+    order (a slightly shorter video is far better than none).
     """
     try:
+        _rec_status_set(student_id, exam_id, "assembling", "Assembling the video file.")
         part_dir = os.path.join(RECORDINGS_FOLDER, ".examguard_parts", token)
         deadline = time.time() + max(1, int(wait_seconds))
+
+        def publish(meta, partial):
+            filename = os.path.basename(str(meta.get("filename", "")).strip())
+            if filename and _is_valid_local_webm(partial):
+                final_path = os.path.join(RECORDINGS_FOLDER, filename)
+                if not os.path.isfile(final_path):
+                    os.replace(partial, final_path)
+                try:
+                    for n in os.listdir(part_dir):
+                        try: os.remove(os.path.join(part_dir, n))
+                        except OSError: pass
+                    os.rmdir(part_dir)
+                except OSError: pass
+                print("Background recording finalized:", filename)
+                _deliver_recording_to_admin(final_path, exam_id, student_id, filename, token, expected_last_seq)
+                return True
+            return False
+
         while time.time() < deadline:
             meta = _load_recording_meta(part_dir) if os.path.isdir(part_dir) else None
             if meta and str(meta.get("student_id", "")) == str(student_id) and str(meta.get("exam_id", "")) == str(exam_id):
                 next_seq, partial = _assemble_ready_recording_parts(part_dir, meta)
                 if expected_last_seq is None or next_seq > expected_last_seq:
-                    filename = os.path.basename(str(meta.get("filename", "")).strip())
-                    if filename and _is_valid_local_webm(partial):
-                        final_path = os.path.join(RECORDINGS_FOLDER, filename)
-                        if not os.path.isfile(final_path):
-                            os.replace(partial, final_path)
-                        try:
-                            for n in os.listdir(part_dir):
-                                try: os.remove(os.path.join(part_dir, n))
-                                except OSError: pass
-                            os.rmdir(part_dir)
-                        except OSError: pass
-                        print("Background recording finalized:", filename)
-                        # FIX: no longer also signals the admin to
-                        # reconstruct its own copy from individually
-                        # pushed chunks — that pipeline is gone (see
-                        # upload_exam_recording_chunk). This verified
-                        # local file is the only source pushed to admin.
-                        _queue_recording_for_admin(final_path, exam_id, student_id, filename)
+                    if publish(meta, partial):
                         return True
+            elif not os.path.isdir(part_dir):
+                # Already finalized by the browser's own finalize call.
+                st = _rec_status_get(student_id, exam_id)
+                if st.get("state") in ("uploading", "done"):
+                    return True
             time.sleep(0.25)
+
+        meta = _load_recording_meta(part_dir) if os.path.isdir(part_dir) else None
+        if meta and str(meta.get("student_id", "")) == str(student_id) and str(meta.get("exam_id", "")) == str(exam_id):
+            next_seq, partial = _assemble_ready_recording_parts(part_dir, meta)
+            if next_seq > 0 and publish(meta, partial):
+                print("Background recording finalized with partial data:", token)
+                return True
+        st = _rec_status_get(student_id, exam_id)
+        if st.get("state") not in ("uploading", "done"):
+            _rec_status_set(student_id, exam_id, "failed", "The recording could not be assembled.")
         print("Background recording finalize timed out:", token)
     except Exception as e:
+        _rec_status_set(student_id, exam_id, "failed", "Recording processing error.")
         print("Background recording finalize error:", str(e))
     return False
 
@@ -3382,9 +3910,12 @@ def student_live_frame():
         safe_id = _safe_live_sync_id(student_id)
         os.makedirs(LIVE_FRAMES_FOLDER, exist_ok=True)
         frame_path = os.path.join(LIVE_FRAMES_FOLDER, f"{safe_id}.jpg")
-        temp_path = frame_path + ".uploading"
-        if not cv2.imwrite(temp_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 55]):
+        temp_path = frame_path + f".{uuid.uuid4().hex[:8]}.uploading"
+        _ok_jpg, _jpg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if not _ok_jpg:
             raise IOError("Could not encode live JPEG")
+        with open(temp_path, "wb") as _jpg_fh:
+            _jpg_fh.write(_jpg_buf.tobytes())
 
         # Atomic replacement means admin never reads a half-written JPEG.
         os.replace(temp_path, frame_path)
@@ -3408,7 +3939,8 @@ def student_live_frame():
             "status": stats.get("status", "Monitoring"),
             "warning": bool(stats.get("warning", False)),
             "warning_message": stats.get("warning_message", ""),
-            "student_signal_base_url": _student_public_signal_base_url()
+            "student_signal_base_url": _student_public_signal_base_url(),
+            **_live_violation_fields(student_id),
         }
         status_path = os.path.join(LIVE_FRAMES_FOLDER, f"{safe_id}.json")
         status_tmp = status_path + ".uploading"
@@ -3464,6 +3996,7 @@ def live_presence():
             "warning": False,
             "warning_message": "",
             "student_signal_base_url": _student_public_signal_base_url(),
+            **_live_violation_fields(sid),
         }
         _schedule_live_heartbeat_sync(sid, payload)
         return jsonify({"success": True})
@@ -3811,25 +4344,77 @@ def internal_voice_clear(student_id):
     return jsonify({"success": True})
 
 
+UNLOCK_FAILS = {}
+UNLOCK_FAILS_LOCK = threading.Lock()
+UNLOCK_MAX_WRONG = 5
+UNLOCK_LOCKOUT_SECONDS = 30
+
+
+def _unlock_letters():
+    return re.sub(r"[^A-Za-z]", "", str(KEYBOARD_UNLOCK_PASSWORD or ""))
+
+
+@app.route("/student/exam/<exam_id>/recording-status")
+@student_login_required
+def recording_status(exam_id):
+    """Polled by the on-screen keyboard page while the video is being saved."""
+    st = _rec_status_get(session.get("student_id", ""), exam_id)
+    state = st.get("state", "none") if st else "none"
+    return jsonify({
+        "success": True,
+        "state": state,
+        "detail": st.get("detail", "") if st else "",
+        "ready": _recording_ready(session.get("student_id", ""), exam_id),
+    })
+
+
 @app.route("/student/exam/keyboard-unlock", methods=["POST"])
 @student_login_required
 def keyboard_unlock():
-    """Validate the teacher unlock password without exposing it to the browser."""
+    """Validate the unlock password typed on the ON-SCREEN keyboard.
+
+    Letters only (case-insensitive), rate limited, and refused until the exam
+    recording has been handed over so the unlock cannot cut it short.
+    """
     data = request.get_json(silent=True) or {}
     exam_id = str(data.get("exam_id", "")).strip()
-    candidate = str(data.get("password", ""))
+    raw_candidate = str(data.get("password", ""))
+    candidate = raw_candidate
 
-    current_exam = str(session.get("current_exam_id", ""))
-    result_exam = str(session.get("result_lock_exam_id", ""))
-    if not exam_id or exam_id not in (current_exam, result_exam):
-        return jsonify({"success": False, "unlocked": False}), 403
+    allowed = {str(session.get("current_exam_id", "")), str(session.get("result_lock_exam_id", "")),
+               str(session.get("kb_locked_exam", ""))}
+    allowed.discard("")
+    if not exam_id or exam_id not in allowed:
+        return jsonify({"success": False, "unlocked": False, "error": "forbidden"}), 403
 
-    # Only the server knows the real password.
-    unlocked = bool(KEYBOARD_UNLOCK_PASSWORD and KEYBOARD_UNLOCK_PASSWORD != ""
-                    and candidate == KEYBOARD_UNLOCK_PASSWORD)
-    if unlocked and result_exam and exam_id == result_exam:
+    student_id = str(session.get("student_id", ""))
+    now = time.time()
+    with UNLOCK_FAILS_LOCK:
+        entry = UNLOCK_FAILS.get(student_id, {"count": 0, "until": 0.0})
+        if entry["until"] > now:
+            return jsonify({"success": False, "unlocked": False, "error": "rate_limited",
+                            "retry_after": int(entry["until"] - now) + 1}), 429
+
+    if not _recording_ready(student_id, exam_id):
+        return jsonify({"success": True, "unlocked": False, "reason": "recording_pending"})
+
+    real = _unlock_letters()
+    ok = bool(real) and raw_candidate.isalpha() and raw_candidate.isascii() and candidate.lower() == real.lower()
+    with UNLOCK_FAILS_LOCK:
+        if ok:
+            UNLOCK_FAILS.pop(student_id, None)
+        else:
+            entry = UNLOCK_FAILS.setdefault(student_id, {"count": 0, "until": 0.0})
+            entry["count"] += 1
+            if entry["count"] >= UNLOCK_MAX_WRONG:
+                entry["count"] = 0
+                entry["until"] = now + UNLOCK_LOCKOUT_SECONDS
+
+    if ok:
         session.pop("result_lock_exam_id", None)
-    return jsonify({"success": True, "unlocked": unlocked})
+        session.pop("kb_locked", None)
+        session.pop("kb_locked_exam", None)
+    return jsonify({"success": True, "unlocked": ok})
 
 
 @app.route("/student/exam/<exam_id>")
@@ -3844,34 +4429,24 @@ def start_exam(exam_id):
     # violations), they cannot start it again.
     # =========================================================
     results_workbook = load_database()
+    try:
+        prior_attempts = _results_attempts(results_workbook, student_id)
+    finally:
+        results_workbook.close()
 
-    if "Results" in results_workbook.sheetnames:
-
-        results_sheet = results_workbook["Results"]
-
-        for row in results_sheet.iter_rows(min_row=2, values_only=True):
-
-            if row[1] == student_id and row[3] == exam_id:
-
-                exam_status = row[12] if len(row) > 12 and row[12] else "Completed"
-
-                results_workbook.close()
-
-                if exam_status != "Completed":
-                    flash(
-                        f"Your access to this exam was ended due to a policy violation ({exam_status}). "
-                        "You cannot re-attempt it.",
-                        "error"
-                    )
-                else:
-                    flash(
-                        "You have already completed this exam and cannot retake it.",
-                        "error"
-                    )
-
-                return redirect(url_for("student_dashboard"))
-
-    results_workbook.close()
+    prior_status = prior_attempts.get(str(exam_id).strip())
+    if prior_status is not None:
+        if prior_status != "Completed":
+            flash(
+                f"Your access to this exam was ended ({prior_status}). You cannot re-attempt it.",
+                "error"
+            )
+        else:
+            flash(
+                "You have already completed this exam and cannot retake it.",
+                "error"
+            )
+        return redirect(url_for("student_dashboard"))
 
     workbook = load_database()
 
@@ -3948,7 +4523,7 @@ def start_exam(exam_id):
     # =========================================================
     # AVAILABILITY WINDOW — only enforced if the teacher set one
     # =========================================================
-    now = datetime.now()
+    now = _now_local()
 
     def _to_datetime(raw_value):
         """
@@ -3973,7 +4548,7 @@ def start_exam(exam_id):
 
         raw_value = raw_value.strip()
 
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
             try:
                 return datetime.strptime(raw_value, fmt)
             except ValueError:
@@ -4003,6 +4578,20 @@ def start_exam(exam_id):
     # used by monitor_exam() to tag live frames for the admin system
     session["current_exam_id"] = exam_id
     session["current_exam_duration_minutes"] = duration_minutes
+    with LIVE_VIOLATION_LOCK:
+        LIVE_VIOLATION_STATE.pop(str(student_id), None)
+
+    begun_at = EXAM_BEGIN_TIMES.get(_rec_key(student_id, exam_id))
+    if begun_at is not None:
+        remaining = int(duration_minutes * 60 - (time.time() - begun_at))
+        if remaining <= 0:
+            _record_forfeit(student_id, session.get("student_name", ""), session.get("student_email", ""),
+                            exam_id, "Time Expired — Auto Submitted")
+            flash("Your exam time is over. The attempt has been closed.", "error")
+            return redirect(url_for("student_dashboard"))
+        session["current_exam_remaining_seconds"] = remaining
+    else:
+        session["current_exam_remaining_seconds"] = duration_minutes * 60
 
     return render_template(
 
@@ -4073,6 +4662,7 @@ def exam_violation():
             violation_type,
             message
         )
+        _note_violation(session.get("student_id", ""), exam_id, violation_type, message)
 
 
         return jsonify({
@@ -4104,6 +4694,16 @@ def exam_violation():
         })
 
 
+
+
+@app.route("/student/exam/preflight-config")
+@student_login_required
+def preflight_config():
+    """Settings for the pre-exam microphone / volume check popup."""
+    return jsonify({
+        "require_volume": os.environ.get("EXAMGUARD_REQUIRE_VOLUME_CHECK", "1").strip().lower() not in ("0", "false", "no", "off"),
+        "min_tone_db": float(os.environ.get("EXAMGUARD_VOLUME_MIN_DB", "-40")),
+    })
 
 
 @app.route("/student/exam/audio-warning", methods=["POST"])
@@ -4159,6 +4759,7 @@ def tab_violation():
         "tab_switch",
         f"{message} (count: {violation_count})"
     )
+    _note_violation(session.get("student_id", ""), exam_id, "tab_switch_autoend", message)
 
     return jsonify({
         "success": True,
@@ -4212,6 +4813,8 @@ EXAM_RECORDING_SCRIPT = r"""
 <script>
 (() => {
   const examId = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop());
+  const ICE_SERVERS = __ICE_SERVERS_JSON__;
+  const EXAM_DURATION_MIN = __EXAM_DURATION_MIN__;
   let stream = null;
   let recorder = null;
   let chunks = [];
@@ -4237,82 +4840,61 @@ EXAM_RECORDING_SCRIPT = r"""
   }
   function makeRecordingToken(){try{if(window.crypto?.randomUUID)return crypto.randomUUID().replace(/-/g,'');}catch(e){}return ('rg'+Date.now().toString(36)+Math.random().toString(36).slice(2)).replace(/[^A-Za-z0-9_-]/g,'');}
   async function fetchWithTimeout(url,options,ms=2500){const c=new AbortController(),t=setTimeout(()=>c.abort(),ms);try{return await fetch(url,{...options,signal:c.signal});}finally{clearTimeout(t);}}
-  async function sendRecordingPart(blob,seq,attempts=2){
-    if(!blob||!blob.size)return false;
+  const sleep = ms => new Promise(r=>setTimeout(r,ms));
+  let uploadPumpRunning = false;
+  let uploadGiveUp = false;
+  let uploadFailStreak = 0;
+
+  async function sendRecordingPart(blob,seq,attempts=3){
+    if(!blob||!blob.size){recordingBlobStore.delete(Number(seq));return true;}
     for(let a=1;a<=attempts;a++){
       try{
         const fd=new FormData();fd.append('video',blob,`chunk_${seq}.webm`);
-        const r=await fetchWithTimeout(`/student/exam/${encodeURIComponent(examId)}/upload-recording-chunk`,{method:'POST',body:fd,credentials:'same-origin',headers:{'X-Recording-Token':recordingToken,'X-Recording-Seq':String(seq)}},2500);
+        const r=await fetchWithTimeout(`/student/exam/${encodeURIComponent(examId)}/upload-recording-chunk`,{method:'POST',body:fd,credentials:'same-origin',headers:{'X-Recording-Token':recordingToken,'X-Recording-Seq':String(seq)}},25000);
         const d=await r.json().catch(()=>({}));
         if(r.ok&&d.success){if(d.filename)uploadedFile=d.filename;recordingBlobStore.delete(Number(seq));return true;}
       }catch(e){console.warn('Recording upload',seq,a,e);}
-      await new Promise(r=>setTimeout(r,Math.min(800,a*180)));
+      await sleep(Math.min(2500,a*600));
     }
     return false;
   }
+  // Up to 3 parts upload at the same time (the server puts them back in
+  // order by sequence number), so the backlog at the end of the exam is tiny.
+  const inFlightParts=new Set();
+  function pumpUploads(){
+    if(uploadGiveUp)return;
+    while(inFlightParts.size<3){
+      const next=Array.from(recordingBlobStore.keys()).filter(k=>!inFlightParts.has(k)).sort((x,y)=>x-y)[0];
+      if(next===undefined)break;
+      inFlightParts.add(next);
+      sendRecordingPart(recordingBlobStore.get(next),next,3).then(ok=>{
+        uploadFailStreak=ok?0:uploadFailStreak+1;
+        inFlightParts.delete(next);
+        if(recordingBlobStore.size&&!uploadGiveUp)setTimeout(pumpUploads,ok?0:Math.min(8000,1000*uploadFailStreak));
+      }).catch(()=>{inFlightParts.delete(next);setTimeout(pumpUploads,1500);});
+    }
+  }
   function queueRecordingPart(blob){
-    const seq=recordingSeq++; recordingBlobStore.set(seq,blob);
-    const task=sendRecordingPart(blob,seq); pendingRecordingUploads.set(seq,task); task.finally(()=>pendingRecordingUploads.delete(seq));
+    const seq=recordingSeq++; recordingBlobStore.set(seq,blob); pumpUploads();
   }
   async function waitForRecordingUploads(ms=3000){
-    const end=Date.now()+ms; while(pendingRecordingUploads.size&&Date.now()<end){await Promise.race([Promise.allSettled(Array.from(pendingRecordingUploads.values())),new Promise(r=>setTimeout(r,150))]);}
+    const end=Date.now()+ms; pumpUploads();
+    while(recordingBlobStore.size&&Date.now()<end){await sleep(150);}
+    return recordingBlobStore.size===0;
   }
-  async function retryMissing(seq){
-    const blob=recordingBlobStore.get(Number(seq)); if(!blob)return;
-    if(pendingRecordingUploads.has(Number(seq)))return;
-    const task=sendRecordingPart(blob,Number(seq),4); pendingRecordingUploads.set(Number(seq),task); task.finally(()=>pendingRecordingUploads.delete(Number(seq)));
-    return task;
-  }
+  function retryMissing(seq){ pumpUploads(); return Promise.resolve(); }
   async function finalizeRecording(){
     if(!recordingToken||recordingSeq===0)return '';
-    // Give the final MediaRecorder chunk a moment to finish uploading, then
-    // actively ask the server to assemble the complete recording. This is the
-    // primary path; the server-side background finalizer remains the fallback.
-    await waitForRecordingUploads(1800);
     const expected=recordingSeq-1;
-    for(let attempt=1;attempt<=3;attempt++){
+    for(let attempt=1;attempt<=4;attempt++){
       const fd=new FormData();fd.append('recording_token',recordingToken);fd.append('expected_last_seq',String(expected));
       try{
-        const r=await fetchWithTimeout(`/student/exam/${encodeURIComponent(examId)}/finalize-recording`,{method:'POST',body:fd,credentials:'same-origin'},2600);
+        const r=await fetchWithTimeout(`/student/exam/${encodeURIComponent(examId)}/finalize-recording`,{method:'POST',body:fd,credentials:'same-origin'},15000);
         const d=await r.json().catch(()=>({}));
         if(r.ok&&d.success){uploadedFile=d.filename||uploadedFile||'';return uploadedFile;}
-        if(d.retry&&Array.isArray(d.missing_sequences)){
-          const missing=d.missing_sequences.slice(0,80);
-          await Promise.all(missing.map(retryMissing)); await waitForRecordingUploads(900); continue;
-        }
+        if(d.retry&&Array.isArray(d.missing_sequences)){await retryMissing(); await waitForRecordingUploads(4000); continue;}
       }catch(e){console.warn('Recording finalize retry',attempt,e);}
-      await new Promise(r=>setTimeout(r,300));
-    }
-    throw new Error('Recording finalization failed');
-  }
-  async function uploadCompleteRecording(){
-    if(!chunks.length)return '';
-    const mime = (recorder && recorder.mimeType) || (chunks[0] && chunks[0].type) || 'video/webm';
-    const completeBlob = new Blob(chunks, {type:mime});
-    if(!completeBlob.size)return '';
-    const fd = new FormData();
-    fd.append('video', completeBlob, 'exam_recording.webm');
-    if(recordingToken) fd.append('recording_token', recordingToken);
-
-    // This is the primary recording path. It writes one complete WebM file on
-    // the Student server, avoiding any dependency on the rolling chunk order.
-    for(let attempt=1; attempt<=3; attempt++){
-      try{
-        const r = await fetchWithTimeout(
-          `/student/exam/${encodeURIComponent(examId)}/upload-recording`,
-          {method:'POST', body:fd, credentials:'same-origin'},
-          180000
-        );
-        const d = await r.json().catch(()=>({}));
-        if(r.ok && d.success && d.filename){
-          uploadedFile = d.filename;
-          return uploadedFile;
-        }
-        console.warn('Complete recording upload rejected:', d);
-      }catch(e){
-        console.warn('Complete recording upload attempt', attempt, e);
-      }
-      await new Promise(r=>setTimeout(r, 700 * attempt));
+      await sleep(500*attempt);
     }
     return '';
   }
@@ -4324,30 +4906,40 @@ EXAM_RECORDING_SCRIPT = r"""
     const seqInput=addHiddenField(form,'recording_expected_last_seq');
     if(window.__aiStopMonitoring)window.__aiStopMonitoring(); if(window.__aiStopAudioMonitoring)window.__aiStopAudioMonitoring(); if(window.__aiStopAdminVoice)window.__aiStopAdminVoice(); if(window.__aiStopLiveVideo)window.__aiStopLiveVideo();
 
-    // Stop MediaRecorder first so its final dataavailable event is included in
-    // `chunks`. Then upload the complete recording as ONE durable WebM file.
-    // The older rolling-chunk pipeline remains below as a fallback only.
+    // Show progress so the student never sees a frozen page.
+    const ov=document.getElementById('ai-fs-ending-overlay');
+    const ovTitle=document.getElementById('ai-fs-ending-title');
+    const ovMsg=document.getElementById('ai-fs-ending-msg');
+    if(ov) ov.style.display='flex';
+    if(ovTitle) ovTitle.textContent='Saving your exam';
+    const say=t=>{ if(ovMsg) ovMsg.textContent=t; status(t); };
+    say('Saving your exam video...');
+    const progress=setInterval(()=>{ const n=recordingBlobStore.size; say(n?`Saving your exam video... (${n} part${n>1?'s':''} left)`:'Finishing up...'); },700);
+
+    // Stop MediaRecorder so its final dataavailable chunk is queued.
     try{
-      if(recorder&&recorder.state!=='inactive')await new Promise(resolve=>{recorder.addEventListener('stop',resolve,{once:true});recorder.stop();});
+      if(recorder&&recorder.state!=='inactive')await Promise.race([
+        new Promise(resolve=>{recorder.addEventListener('stop',resolve,{once:true});try{recorder.requestData();}catch(e){}recorder.stop();}),
+        sleep(4000)
+      ]);
     }catch(e){console.error('Recorder stop failed:',e);}
 
-    status('Saving recording...');
-    // Recording chunks have been uploading continuously during the exam.
-    // Do not send a second giant Blob here; that was the source of the
-    // upload-time failures and unnecessary delay. Give in-flight chunks a
-    // short window, then finalize the already-transferred sequence.
+    // Upload the remaining chunks (in order) then ask the server to assemble.
+    // Hard cap: after that the server-side finalizer salvages what arrived.
     try{
       await Promise.race([
-        (async()=>{ await waitForRecordingUploads(4500); if(recordingToken) await finalizeRecording(); })(),
-        new Promise(resolve=>setTimeout(resolve,6000))
+        (async()=>{ await waitForRecordingUploads(28000); if(recordingToken) await finalizeRecording(); })(),
+        sleep(36000)
       ]);
     }catch(e){console.warn('Recording finalize deferred to background:',e);}
+    uploadGiveUp=true; clearInterval(progress);
 
     hidden.value=uploadedFile||'';
     tokenInput.value=recordingToken||'';
     seqInput.value=String(Math.max(0, recordingSeq - 1));
     if(stream)stream.getTracks().forEach(t=>t.stop());
-    status(uploadedFile ? 'Recording saved. Submitting exam...' : 'Submitting exam...');
+    window.__aiAllowUnload=true;
+    say('Submitting exam...');
     nativeSubmit.call(form);
   }
 
@@ -4357,6 +4949,25 @@ EXAM_RECORDING_SCRIPT = r"""
   // so the admin preview is not blocked by MediaPipe.
   let monitorTimer = null;
   let monitorInFlight = false;
+  let monitorFailStreak = 0;
+  let monitorOkAt = Date.now();
+  function noteMonitorHealth(ok){
+    monitorFailStreak = ok ? 0 : monitorFailStreak + 1;
+    const offline = monitorFailStreak >= 5;
+    if (offline) {
+      statusPill.textContent = 'AI check reconnecting...';
+      statusPill.classList.add('warn');
+    } else if (ok && statusPill.textContent === 'AI check reconnecting...') {
+      statusPill.textContent = 'Monitoring Active';
+      statusPill.classList.remove('warn');
+    }
+    if (monitorFailStreak === 5) {
+      // Tell the server once so the problem is visible in the logs / admin view.
+      try { fetch('/student/exam/violation', {method:'POST', credentials:'same-origin', keepalive:true,
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({type:'monitor_offline', message:'AI face monitoring is not responding', exam_id: examId, timestamp: new Date().toISOString()})}).catch(()=>{}); } catch(e) {}
+    }
+  }
 
   function startMonitoringLoop(){
     monitorTimer = setInterval(async () => {
@@ -4365,21 +4976,24 @@ EXAM_RECORDING_SCRIPT = r"""
 
       try {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const imageData = canvas.toDataURL('image/jpeg', 0.6);
+        const imageData = canvas.toDataURL('image/jpeg', 0.7);
 
-        const res = await fetch('/student/exam/monitor', {
+        const res = await fetchWithTimeout('/student/exam/monitor', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
+          credentials: 'same-origin',
           body: JSON.stringify({image: imageData, exam_id: examId})
-        });
+        }, 9000);
         const data = await res.json();
-        if (data.success) updateStats(data.stats);
+        if (data.success) { updateStats(data.stats); noteMonitorHealth(true); }
+        else { console.error('Monitoring rejected:', data.error); noteMonitorHealth(false); }
       } catch (e) {
         console.error('Monitoring error:', e);
+        noteMonitorHealth(false);
       } finally {
         monitorInFlight = false;
       }
-    }, 1500);
+    }, 1000);
   }
 
   window.__aiStopMonitoring = () => {
@@ -4428,37 +5042,57 @@ EXAM_RECORDING_SCRIPT = r"""
     }
   }
 
+  const FACE_WARNING_TYPES = [
+    'phone_warning','head_direction_warning','head_pitch_warning',
+    'head_roll_warning','eyes_closed_warning','gaze_warning',
+    'mouth_warning','multiple_face_warning','no_face_warning','face_warning','lighting_warning'
+  ];
+
+  function legacyTypeFromMessage(msg){
+    if (/too dark|dim/i.test(msg)) return 'lighting_warning';
+    if (/phone/i.test(msg)) return 'phone_warning';
+    if (/Multiple faces|Other person/i.test(msg)) return 'multiple_face_warning';
+    if (/Face not detected/i.test(msg)) return 'no_face_warning';
+    if (/Eyes closed/i.test(msg)) return 'eyes_closed_warning';
+    if (/Eyes are not looking/i.test(msg)) return 'gaze_warning';
+    if (/Mouth movement/i.test(msg)) return 'mouth_warning';
+    if (/look straight/i.test(msg)) return 'head_direction_warning';
+    if (/face straight/i.test(msg)) return 'head_pitch_warning';
+    if (/head straight|tilt/i.test(msg)) return 'head_roll_warning';
+    return 'face_warning';
+  }
+
   function updateStats(stats){
+    stats = stats || {};
+    monitorOkAt = Date.now();
+    if (stats.terminate && window.__aiTerminate) {
+      window.__aiTerminate(stats.terminate_reason || 'no_face_timeout');
+    }
     const wasActive = faceWarningActive;
     faceWarningActive = !!stats.warning;
     faceWarningMsg = stats.warning_message || '';
     if (faceWarningActive && !wasActive) faceWarningSince = Date.now();
     refreshWarningUI();
 
-    if (stats.warning && window.__aiRegisterWarning) {
-      const msg = stats.warning_message || 'Attention warning detected';
-      let type = 'face_warning';
-      if (/phone/i.test(msg)) type = 'phone_warning';
-      else if (/Movement detected/i.test(msg)) type = 'movement_warning';
-      else if (/look straight/i.test(msg)) type = 'head_direction_warning';
-      else if (/face straight/i.test(msg)) type = 'head_pitch_warning';
-      else if (/head straight|tilt/i.test(msg)) type = 'head_roll_warning';
-      else if (/Eyes closed/i.test(msg)) type = 'eyes_closed_warning';
-      else if (/Eyes are not looking/i.test(msg)) type = 'gaze_warning';
-      else if (/Mouth movement/i.test(msg)) type = 'mouth_warning';
-      else if (/Multiple faces|Other person/i.test(msg)) type = 'multiple_face_warning';
-      else if (/Face not detected/i.test(msg)) type = 'no_face_warning';
-      window.__aiRegisterWarning(type, msg);
-    } else if (window.__aiClearWarningType) {
-      // The condition is clear again, so a future separate occurrence
-      // of the same type is allowed to count as a new warning.
-      const warningTypes = [
-        'phone_warning','head_direction_warning','head_pitch_warning',
-        'head_roll_warning','eyes_closed_warning','gaze_warning',
-        'mouth_warning','multiple_face_warning','no_face_warning',
-        'face_warning'
-      ];
-      warningTypes.forEach(window.__aiClearWarningType);
+    // The server may report several simultaneous problems (e.g. phone AND
+    // another person). Each distinct type counts once per occurrence.
+    let list = Array.isArray(stats.warnings) ? stats.warnings.slice() : [];
+    if (!list.length && stats.warning) {
+      const m = stats.warning_message || 'Attention warning detected';
+      list = [{type: stats.warning_type || legacyTypeFromMessage(m), message: m}];
+    }
+    const activeTypes = new Set();
+    list.forEach(w => {
+      if (!w || !w.type) return;
+      activeTypes.add(w.type);
+      if (window.__aiRegisterWarning) window.__aiRegisterWarning(w.type, w.message || 'Warning');
+    });
+    if (window.__aiClearWarningType) {
+      FACE_WARNING_TYPES.forEach(t => { if (!activeTypes.has(t)) window.__aiClearWarningType(t); });
+    }
+    if (list.length > 1) {
+      faceWarningMsg = list.map(w => w.message).join(' | ');
+      refreshWarningUI();
     }
   }
 
@@ -4495,18 +5129,21 @@ EXAM_RECORDING_SCRIPT = r"""
         if (audioContext.state === 'suspended') audioContext.resume().catch(()=>{});
       };
       tryResume();
-      document.addEventListener('click', tryResume);
-      document.addEventListener('keydown', tryResume);
+      ['click','keydown','pointerdown','pointermove','touchstart','focus'].forEach(ev => document.addEventListener(ev, tryResume, {passive:true}));
       window.__aiResumeAudioContext = tryResume;
 
       let calibration = [];
       let baseline = 0.006;
-      let consecutive = 0;
       let lastWarningAt = 0;
+      const recent = [];           // last 5 readings: true = loud
       const calibrationEnd = Date.now() + 4000;
-      const ABSOLUTE = 0.024;
-      const REQUIRED = 5;     // 5 x 250 ms = 1.25 s sustained
-      const COOLDOWN = 10000; // sustained audio must stop before another warning
+      const ABSOLUTE = 0.011;      // lowest level ever treated as speech
+      const COOLDOWN = 8000;       // quiet time needed before the next strike
+      let silentTicks = 0, micAlertAt = 0, micMutedWarned = false;
+
+      const freq = new Uint8Array(analyser.frequencyBinCount);
+      const binHz = audioContext.sampleRate / analyser.fftSize;
+      const lo = Math.floor(250 / binHz), hi = Math.ceil(3400 / binHz);
 
       const timer = setInterval(() => {
         if (submitting) return;
@@ -4521,38 +5158,66 @@ EXAM_RECORDING_SCRIPT = r"""
         }
         const level = Math.sqrt(sum / dataArray.length);
 
+        // How much of the sound sits in the human-voice band (250-3400 Hz).
+        analyser.getByteFrequencyData(freq);
+        // (Average strength inside the voice band compared with the average over
+        // all frequencies. The old version compared the SUM, but the voice band is
+        // only ~13% of all frequency slots, so real speech could never pass.)
+        let band = 0, all = 0;
+        for (let i=1; i<freq.length; i++) { all += freq[i]; if (i>=lo && i<=hi) band += freq[i]; }
+        const bandMean = band / Math.max(1, hi - lo + 1);
+        const allMean = all / Math.max(1, freq.length - 1);
+        const voiceShare = allMean > 0 ? bandMean / allMean : 0;
+
+        // ---- microphone health: a dead / muted mic must be noticed, not ignored
+        const tr = mediaStream.getAudioTracks()[0];
+        const dead = !tr || tr.readyState === 'ended' || tr.muted || level < 0.0006;
+        silentTicks = dead ? silentTicks + 1 : 0;
+        if (silentTicks >= 80 && !micMutedWarned) {      // 20 s of complete silence: muted / unplugged
+          micMutedWarned = true;
+          try { if (window.__aiRegisterWarning) window.__aiRegisterWarning('mic_muted', 'Microphone is muted or not working. Keep it on during the exam.'); } catch(e) {}
+        }
+        if (silentTicks >= 60 && Date.now() - micAlertAt > 60000) {   // 15 s of nothing
+          micAlertAt = Date.now();
+          try { status('\u26A0 Microphone is not picking up any sound'); } catch(e) {}
+          try { fetch('/student/exam/violation', {method:'POST', credentials:'same-origin', keepalive:true,
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({type:'mic_silent', message:'Microphone is silent / muted during the exam', exam_id: examId, timestamp: new Date().toISOString()})}).catch(()=>{}); } catch(e) {}
+        }
+
         if (Date.now() < calibrationEnd) {
           calibration.push(level);
           calibration = calibration.slice(-20);
           if (calibration.length >= 5) {
             const sorted = calibration.slice().sort((a,b)=>a-b);
-            baseline = sorted[Math.floor(sorted.length/2)] || baseline;
+            baseline = sorted[Math.floor(sorted.length * 0.25)] || baseline;   // quiet part only
           }
-          consecutive = 0;
           return;
         }
 
         // Track only the quiet baseline; never let loud audio raise the baseline.
-        if (level < Math.max(0.032, baseline * 1.25)) {
+        if (level < Math.max(0.03, baseline * 1.25)) {
           baseline = baseline * 0.98 + level * 0.02;
         }
 
-        const threshold = Math.max(ABSOLUTE, baseline * 2.0 + 0.008);
-        consecutive = level >= threshold ? consecutive + 1 : 0;
+        const threshold = Math.max(ABSOLUTE, baseline * 2.0 + 0.006);
+        const loud = level >= threshold && voiceShare > 0.85;
+        recent.push(loud); if (recent.length > 5) recent.shift();
+        const loudCount = recent.filter(Boolean).length;
 
-        // A quiet period ends the current audio-warning event. This lets a
-        // genuinely new speaking/noise episode count later without turning
-        // one continuous sound into three strikes.
-        if (level < threshold && audioWarningActive) {
+        // Speaking = at least 3 loud readings out of the last 5 (about 1 second).
+        // A genuinely quiet spell (4 of the last 5 quiet) closes the event, so a
+        // new speaking episode counts again but one long chat is not 3 strikes.
+        if (loudCount <= 1 && audioWarningActive && Date.now() - lastWarningAt > COOLDOWN) {
           updateAudioStatus({warning:false, warning_message:''});
         }
 
-        if (consecutive >= REQUIRED && !audioWarningActive) {
-          consecutive = 0;
+        if (loudCount >= 3 && !audioWarningActive) {
+          recent.length = 0;
           lastWarningAt = Date.now();
           updateAudioStatus({
             warning: true,
-            warning_message: '🔊 Audio detected. Please remain silent during the examination.',
+            warning_message: '\uD83D\uDD0A Voice / sound detected. Please stay silent during the examination.',
             audio_level: level,
             baseline: baseline
           });
@@ -4568,8 +5233,7 @@ EXAM_RECORDING_SCRIPT = r"""
 
       window.__aiStopAudioMonitoring = () => {
         clearInterval(timer);
-        document.removeEventListener('click', tryResume);
-        document.removeEventListener('keydown', tryResume);
+        ['click','keydown','pointerdown','pointermove','touchstart','focus'].forEach(ev => document.removeEventListener(ev, tryResume));
         try { audioContext.close(); } catch(e) {}
       };
     } catch (e) {
@@ -4645,12 +5309,12 @@ EXAM_RECORDING_SCRIPT = r"""
       // it does NOT run MediaPipe and therefore stays fast.
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       const imageData = canvas.toDataURL('image/jpeg', 0.55);
-      await fetch('/student/exam/live-frame', {
+      await fetchWithTimeout('/student/exam/live-frame', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         credentials: 'same-origin',
         body: JSON.stringify({image: imageData, exam_id: examId})
-      });
+      }, 7000);
     } catch (e) {
       console.debug('[LIVE FRAME] upload', e);
     } finally {
@@ -4660,7 +5324,7 @@ EXAM_RECORDING_SCRIPT = r"""
 
   function startLiveFrameLoop(){
     sendLatestLiveFrame();
-    liveFrameTimer = setInterval(sendLatestLiveFrame, 500);
+    liveFrameTimer = setInterval(sendLatestLiveFrame, 900);
   }
 
   // ===================== DIRECT CAMERA WEBRTC TO ADMIN =====================
@@ -4697,7 +5361,7 @@ EXAM_RECORDING_SCRIPT = r"""
     videoAnswerInFlight=true;
     try{
       if(adminVideoPc){ try{adminVideoPc.close();}catch(e){} adminVideoPc=null; }
-      const pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});
+      const pc=new RTCPeerConnection({iceServers:ICE_SERVERS});
       adminVideoPc=pc;
       // Publish the EXACT MediaStream already shown in the student's preview.
       // IMPORTANT: this is one WebRTC connection carrying BOTH tracks.
@@ -4785,20 +5449,33 @@ EXAM_RECORDING_SCRIPT = r"""
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: {width:{ideal:640}, height:{ideal:480}, facingMode:'user'},
-        audio: true
+        video: {width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:15, max:24}, facingMode:'user'},
+        audio: {
+          echoCancellation: true, noiseSuppression: false, autoGainControl: true,
+          ...(window.__aiAudioDeviceId ? {deviceId: {exact: window.__aiAudioDeviceId}} : {})
+        }
       });
+      if (!stream.getAudioTracks().length) { throw new Error('No microphone track'); }
+      stream.getAudioTracks().forEach(t => { t.enabled = true; });
       video.srcObject = stream;
       primeAdminVoiceAudio();
 
       const types = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm'];
       const mime = types.find(t => MediaRecorder.isTypeSupported(t)) || '';
       recordingToken = makeRecordingToken();
-      recorder = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined);
+      // Keep the whole file under Cloudinary's 100 MB (free plan) video limit and
+      // quick to hand over: budget about 90 MB of video + sound for the exam length,
+      // so a 2 or 3 hour exam gives a grainier but still usable picture.
+      const AUDIO_BPS = 24000;
+      const totalBits = Math.floor(90e6 * 8 / Math.max(300, EXAM_DURATION_MIN * 60 + 180));
+      const targetBits = Math.max(30000, Math.min(380000, totalBits - AUDIO_BPS));
+      const recOpts = mime ? {mimeType:mime} : {};
+      recOpts.videoBitsPerSecond = targetBits; recOpts.audioBitsPerSecond = AUDIO_BPS;
+      try { recorder = new MediaRecorder(stream, recOpts); } catch (e) { recorder = new MediaRecorder(stream, mime ? {mimeType:mime} : undefined); }
       recorder.ondataavailable = e => {
         if (e.data && e.data.size) queueRecordingPart(e.data);
       };
-      recorder.start(1000);
+      recorder.start(2000);
       status('\u25CF Recording');
 
       startMonitoringLoop();
@@ -4906,12 +5583,7 @@ EXAM_RECORDING_SCRIPT = r"""
 
       closeAdminVoice();
       adminVoiceOffer = offerKey;
-      adminVoicePC = new RTCPeerConnection({
-        iceServers: [
-          {urls:'stun:stun.l.google.com:19302'},
-          {urls:'stun:stun1.l.google.com:19302'}
-        ]
-      });
+      adminVoicePC = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
       adminVoicePC.ontrack = event => {
         const stream = event.streams && event.streams[0];
@@ -4961,7 +5633,30 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
     display:flex;align-items:center;justify-content:center;text-align:center;
     font-family:'Segoe UI',Arial,sans-serif;color:#e8eaf0;
 }
-#ai-fs-start-overlay .box{max-width:460px;padding:24px}
+#ai-fs-start-overlay .box{max-width:480px;padding:24px;max-height:96vh;overflow:auto}
+#ai-sc{background:#111827;border:1px solid #27324d;border-radius:12px;padding:14px 16px;margin:0 0 16px;text-align:left}
+#ai-sc .sc-title{font-weight:700;font-size:14px;margin-bottom:10px;color:#e8eaf0}
+#ai-sc .sc-row{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid #1e2740}
+#ai-sc .sc-row:first-of-type{border-top:0}
+#ai-sc .sc-ic{flex:0 0 24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:800;background:#1e2740;color:#8891a8}
+#ai-sc .sc-row.ok .sc-ic{background:#16a34a;color:#fff}
+#ai-sc .sc-row.bad .sc-ic{background:#dc2626;color:#fff}
+#ai-sc .sc-row.run .sc-ic{background:#2563eb;color:#fff;animation:ai-sc-pulse 1s infinite}
+@keyframes ai-sc-pulse{50%{opacity:.45}}
+#ai-sc b{display:block;font-size:13.5px;color:#e8eaf0}
+#ai-sc small{display:block;font-size:12.5px;color:#9aa4bd;line-height:1.5;margin-top:2px}
+#ai-sc .sc-meter{height:6px;border-radius:99px;background:#1e2740;overflow:hidden;margin:8px 0 2px}
+#ai-sc .sc-meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#22c55e,#facc15,#ef4444);transition:width .08s linear}
+#ai-sc select{width:100%;margin-top:8px;background:#0b1220;color:#e8eaf0;border:1px solid #27324d;border-radius:8px;padding:7px;font-size:12.5px}
+#ai-sc-btn{margin-top:10px;width:100%;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:10px;font-weight:700;font-size:14px;cursor:pointer}
+#ai-sc-btn:disabled{opacity:.6;cursor:default}
+#ai-fs-start-btn:disabled{background:#334155;color:#94a3b8;cursor:not-allowed}
+#ai-sc-pop{font-family:'Segoe UI',Arial,sans-serif;position:fixed;inset:0;background:rgba(2,6,18,.78);z-index:2147483640;display:none;align-items:center;justify-content:center}
+#ai-sc-pop.show{display:flex}
+#ai-sc-pop .pbox{width:min(420px,92vw);background:#121a2e;border:1px solid #f59e0b;border-radius:14px;padding:24px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+#ai-sc-pop h2{margin:0 0 10px;font-size:19px;color:#fbbf24}
+#ai-sc-pop p{margin:0 0 16px;font-size:14px;line-height:1.6;color:#d3d9ea}
+#ai-sc-pop button{background:#6366f1;color:#fff;border:0;border-radius:8px;padding:9px 28px;font-weight:700;cursor:pointer}
 #ai-fs-start-overlay .eyebrow{font:600 11.5px monospace;letter-spacing:.08em;
     text-transform:uppercase;color:#5b8cff;margin-bottom:12px}
 #ai-fs-start-overlay h1{font-size:22px;margin:0 0 12px}
@@ -5020,15 +5715,23 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
       <li>The exam will enter fullscreen mode on start</li>
       <li>Your session is recorded for review by your instructor</li>
       <li>Your admin can view your live camera feed on a separate monitoring system</li>
-      <li><strong>Your keyboard will be locked once the exam starts</strong> — if an authorized teacher gives you the unlock password, type it to unlock the keyboard.</li>
+      <li><strong>Your keyboard is completely locked once the exam starts</strong> — use the mouse only. After the exam, unlock it with the on-screen keyboard.</li>
     </ul>
     <div class="danger-note">
       &#9888; If you exit fullscreen or switch tabs/windows at any point, your exam will be
       <strong>automatically submitted immediately</strong> with your answers as they are at that moment.
     </div>
-    <button id="ai-fs-start-btn">Enter Fullscreen &amp; Start Exam</button>
+    <div id="ai-sc" style="display:none">
+      <div class="sc-title">Sound &amp; microphone check (required)</div>
+      <div class="sc-row" id="sc-vol"><span class="sc-ic">1</span><div><b>Computer volume at 100%</b><small id="sc-vol-t">Set your computer volume to 100%, then press the button below. A short beep will play and your microphone must hear it.</small></div></div>
+      <div class="sc-row" id="sc-mic"><span class="sc-ic">2</span><div><b>Microphone works</b><small id="sc-mic-t">After the volume check, say &ldquo;I am ready&rdquo; aloud.</small><div class="sc-meter"><i id="sc-meter-i"></i></div></div></div>
+      <select id="sc-dev" style="display:none" title="Microphone"></select>
+      <button type="button" id="ai-sc-btn">Start sound check</button>
+    </div>
+    <button id="ai-fs-start-btn" disabled>Enter Fullscreen &amp; Start Exam</button>
   </div>
 </div>
+<div id="ai-sc-pop"><div class="pbox"><h2 id="ai-sc-pop-t"></h2><p id="ai-sc-pop-m"></p><button type="button" id="ai-sc-pop-ok">OK</button></div></div>
 
 <div id="ai-fs-ending-overlay">
   <div class="box">
@@ -5122,6 +5825,17 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
     warningActiveTypes.delete(String(type || 'face_warning'));
   };
 
+  // The camera has shown nobody for too long: end the exam straight away.
+  window.__aiTerminate = function(reason){
+    if (!examStarted || examEnding) return;
+    if (Date.now() < examStartGraceUntil) return;
+    autoEndExam(
+      'Your face was not visible for too long.',
+      String(reason || 'no_face_timeout'),
+      'Face not visible for too long \u2014 exam auto-submitted'
+    );
+  };
+
   function showToast(msg){
     toast.textContent = msg;
     toast.style.display = 'block';
@@ -5201,7 +5915,209 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
   }
 
 
+  // =====================================================
+  // SOUND & MICROPHONE CHECK (must pass before the exam can start)
+  // A web page cannot read the computer's volume setting. So it plays a
+  // short beep through the speakers and measures how loudly the microphone
+  // hears it: that proves the volume is turned up and the microphone works.
+  // The check repeats by itself, so as soon as the student raises the volume
+  // the step turns green. Needs speakers (headphones will not pass).
+  // =====================================================
+  (function soundCheck(){
+    const box = document.getElementById('ai-sc');
+    const scBtn = document.getElementById('ai-sc-btn');
+    const volRow = document.getElementById('sc-vol'), micRow = document.getElementById('sc-mic');
+    const volT = document.getElementById('sc-vol-t'), micT = document.getElementById('sc-mic-t');
+    const meter = document.getElementById('sc-meter-i'), devSel = document.getElementById('sc-dev');
+    const pop = document.getElementById('ai-sc-pop'), popT = document.getElementById('ai-sc-pop-t'), popM = document.getElementById('ai-sc-pop-m');
+    document.getElementById('ai-sc-pop-ok').addEventListener('click', () => { pop.classList.remove('show'); popDismissedAt = Date.now(); });
+    let popDismissedAt = 0;
+    let required = true, minToneDb = -40;
+    let passed = false, running = false, volOk = false, micOk = false;
+    let stream = null, ctx = null, an = null, timer = null, osc = null, gain = null;
+    const TONE_HZ = 1000;
+
+    function setRow(row, state, ic){ row.className = 'sc-row ' + state; row.querySelector('.sc-ic').textContent = ic; }
+    function showPop(title, msg){ popT.textContent = title; popM.textContent = msg; pop.classList.add('show'); }
+    function hidePop(){ pop.classList.remove('show'); }
+
+    // keep the Start button locked until both checks pass
+    function lockStart(msg){ startBtn.disabled = true; startBtn.textContent = msg || 'Complete the sound check to start'; }
+    function unlockStart(){ startBtn.disabled = false; startBtn.innerHTML = 'Enter Fullscreen &amp; Start Exam'; }
+
+    // single-frequency level in dBFS (Goertzel)
+    function toneDb(buf, sr, hz){
+      const n = buf.length, k = Math.round(n * hz / sr), w = 2 * Math.PI * k / n, c = 2 * Math.cos(w);
+      let s0 = 0, s1 = 0, s2 = 0;
+      for (let i = 0; i < n; i++) { s0 = buf[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+      const p = s1 * s1 + s2 * s2 - c * s1 * s2;
+      const amp = 2 * Math.sqrt(Math.max(p, 0)) / n;
+      return 20 * Math.log10(amp + 1e-9);
+    }
+    function rms(buf){ let a = 0; for (let i = 0; i < buf.length; i++) a += buf[i] * buf[i]; return Math.sqrt(a / buf.length); }
+
+    function cleanup(){
+      running = false;
+      if (timer) { clearInterval(timer); timer = null; }
+      try { if (osc) osc.stop(); } catch(e) {}
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch(e) {}
+      try { if (ctx) ctx.close(); } catch(e) {}
+      stream = ctx = an = osc = gain = null;
+      meter.style.width = '0';
+    }
+
+    async function begin(){
+      cleanup();
+      volOk = micOk = false; passed = false; lockStart();
+      setRow(volRow, 'run', '1'); setRow(micRow, '', '2');
+      volT.textContent = 'Playing a beep… keep your computer volume at 100% and use speakers (not headphones).';
+      scBtn.disabled = true; scBtn.textContent = 'Checking…';
+      try {
+        const id = devSel.value;
+        stream = await navigator.mediaDevices.getUserMedia({audio: Object.assign(
+          {echoCancellation:false, noiseSuppression:false, autoGainControl:false},
+          id ? {deviceId:{exact:id}} : {})});
+        // list microphones (labels only appear after permission is given)
+        try {
+          const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
+          if (devs.length > 1) {
+            const cur = (stream.getAudioTracks()[0].getSettings() || {}).deviceId || id;
+            devSel.innerHTML = '';
+            devs.forEach(d => { const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.label || 'Microphone'; if (d.deviceId === cur) o.selected = true; devSel.appendChild(o); });
+            devSel.style.display = 'block';
+          }
+        } catch(e) {}
+        ctx = new (window.AudioContext || window.webkitAudioContext)();
+        await ctx.resume();
+        an = ctx.createAnalyser(); an.fftSize = 4096; an.smoothingTimeConstant = 0;
+        ctx.createMediaStreamSource(stream).connect(an);
+      } catch (e) {
+        console.warn('Sound check mic error:', e);
+        cleanup();
+        setRow(volRow, 'bad', '!');
+        volT.textContent = 'The microphone could not be opened. Allow microphone access (and pick the right microphone), then press the button again.';
+        scBtn.disabled = false; scBtn.textContent = 'Try again';
+        showPop('Microphone not available', 'Please allow microphone access in the browser and make sure a microphone is connected. Then press "Try again".');
+        return;
+      }
+      running = true; scBtn.textContent = 'Checking…';
+      runVolumePhase();
+    }
+
+    function runVolumePhase(){
+      const sr = ctx.sampleRate, buf = new Float32Array(an.fftSize);
+      let bursts = 0, goodInRow = 0, failBursts = 0, lastDb = -120, phaseStart = 0, bestInBurst = -120, noiseDb = -120, state = 'quiet';
+      // Each cycle: 0.5 s silence (measure background) -> 0.8 s beep -> 0.4 s rest
+      function playBeep(){
+        try {
+          osc = ctx.createOscillator(); gain = ctx.createGain();
+          osc.type = 'sine'; osc.frequency.value = TONE_HZ;
+          gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+          gain.gain.linearRampToValueAtTime(0.9, ctx.currentTime + 0.05);
+          gain.gain.setValueAtTime(0.9, ctx.currentTime + 0.75);
+          gain.gain.linearRampToValueAtTime(0.0001, ctx.currentTime + 0.8);
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.start(); osc.stop(ctx.currentTime + 0.82);
+        } catch(e) {}
+      }
+      phaseStart = Date.now(); state = 'quiet'; noiseDb = -120;
+      timer = setInterval(() => {
+        if (!running) return;
+        an.getFloatTimeDomainData(buf);
+        const t = Date.now() - phaseStart;
+        const db = toneDb(buf, sr, TONE_HZ);
+        meter.style.width = Math.min(100, Math.max(0, (db + 70) * 100 / 55)) + '%';
+        if (state === 'quiet') {
+          noiseDb = Math.max(noiseDb, db);
+          if (t > 500) { state = 'beep'; phaseStart = Date.now(); bestInBurst = -120; playBeep(); }
+        } else if (state === 'beep') {
+          if (t > 150) bestInBurst = Math.max(bestInBurst, db);
+          if (t > 950) {
+            state = 'rest'; phaseStart = Date.now(); bursts++;
+            lastDb = bestInBurst;
+            const heard = bestInBurst >= minToneDb && (bestInBurst - noiseDb) >= 10;
+            if (heard) { goodInRow++; failBursts = 0; } else { goodInRow = 0; failBursts++; }
+            const shown = bestInBurst < -100 ? 'silence' : Math.round(bestInBurst) + ' dB';
+            if (goodInRow >= 2) {
+              volOk = true; setRow(volRow, 'ok', '✔');
+              volT.textContent = 'Volume is high enough (heard: ' + shown + '). Thank you.';
+              hidePop(); clearInterval(timer); timer = null; runMicPhase(); return;
+            }
+            setRow(volRow, 'bad', '!');
+            volT.textContent = 'The beep was too quiet (heard: ' + shown + ', need ' + minToneDb + ' dB). Turn your computer volume up to 100%, remove headphones, and wait — it re-checks by itself.';
+            if (failBursts >= 2 && Date.now() - popDismissedAt > 15000 && !pop.classList.contains('show')) {
+              showPop('Set your volume to 100%', 'Your computer volume is too low (or headphones are connected). Raise the system volume to 100% and use the speakers. The check repeats automatically and will continue as soon as the volume is high enough.');
+            }
+          }
+        } else if (state === 'rest') {
+          if (t > 450) { state = 'quiet'; phaseStart = Date.now(); noiseDb = -120; }
+        }
+      }, 100);
+    }
+
+    function runMicPhase(){
+      setRow(micRow, 'run', '2');
+      micT.textContent = 'Say “I am ready” aloud in your normal voice.';
+      const buf = new Float32Array(an.fftSize);
+      let loud = 0, start = Date.now(), nagged = false;
+      timer = setInterval(() => {
+        if (!running) return;
+        an.getFloatTimeDomainData(buf);
+        const lv = rms(buf);
+        meter.style.width = Math.min(100, lv * 100 / 0.12 * 1.0) + '%';
+        if (lv >= 0.012) loud++;
+        if (loud >= 8) {   // about 0.8 s of real speech in total
+          micOk = true; setRow(micRow, 'ok', '✔');
+          micT.textContent = 'Microphone works. Thank you.';
+          hidePop(); clearInterval(timer); timer = null; finish(); return;
+        }
+        if (Date.now() - start > 10000 && !nagged) {
+          nagged = true;
+          micT.textContent = 'We cannot hear you. Speak louder or closer, check the microphone choice below, or raise the microphone volume in your computer’s Sound settings.';
+          setRow(micRow, 'bad', '!');
+          showPop('We cannot hear you', 'Say “I am ready” aloud. If nothing is picked up, choose the correct microphone from the list or increase the microphone volume in Windows Sound settings. The check keeps listening.');
+        }
+      }, 100);
+    }
+
+    function finish(){
+      passed = volOk && micOk;
+      const chosen = devSel.style.display !== 'none' ? devSel.value : '';
+      cleanup();
+      if (passed) {
+        window.__aiAudioDeviceId = chosen || undefined;
+        scBtn.textContent = 'Sound check passed ✔'; scBtn.disabled = true; scBtn.style.background = '#16a34a';
+        unlockStart();
+      }
+    }
+
+    devSel.addEventListener('change', () => { if (!passed) begin(); });
+    scBtn.addEventListener('click', begin);
+
+    // Safety net if the exam is started some other way
+    window.__aiSoundCheckPassed = () => !required || passed;
+    window.__aiSoundCheckPopup = () => showPop('Sound check required', 'Complete the sound check first: computer volume at 100% (speakers) and a working microphone. The Start button unlocks automatically when both pass.');
+
+    fetch('/student/exam/preflight-config', {credentials:'same-origin', cache:'no-store'})
+      .then(r => r.ok ? r.json() : {})
+      .then(c => {
+        required = !(c && c.require_volume === false);
+        if (c && typeof c.min_tone_db === 'number') minToneDb = c.min_tone_db;
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!required) { unlockStart(); return; }
+        box.style.display = 'block';
+        lockStart();
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setRow(volRow, 'bad', '!'); volT.textContent = 'This browser cannot use the microphone. Please open the exam in Microsoft Edge or Chrome.';
+          scBtn.disabled = true;
+        }
+      });
+  })();
+
   startBtn.addEventListener('click', async () => {
+    if (window.__aiSoundCheckPassed && !window.__aiSoundCheckPassed()) { if (window.__aiSoundCheckPopup) window.__aiSoundCheckPopup(); return; }
     startBtn.disabled = true;
     startBtn.textContent = 'Requesting camera access...';
 
@@ -5230,6 +6146,11 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
     examStarted = true;
     window.__aiExamStarted = true;
     examStartGraceUntil = Date.now() + 2500;
+    hardLock = true;
+    tryKeyboardLock();
+    fetch('/student/exam/' + encodeURIComponent(examId) + '/begin', {method:'POST', credentials:'same-origin'})
+      .then(r => r.json()).then(d => { if (d && typeof d.remaining_seconds === 'number') window.__aiRemainingSeconds = d.remaining_seconds; })
+      .catch(() => {});
 
     // Resume audio analysis again right after, in case the context
     // was still suspended after creation — same click's activation
@@ -5442,46 +6363,345 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
       .catch(() => { unlockBuffer = ''; });
   }
 
-  function keyboardLockdown(e){
-    if ((!examStarted && !resultLocked) || keyboardUnlocked) return;
-
-    // The result-page password field is the one intentional keyboard target
-    // after an exam ends. Let its typing and Enter key reach the field/button.
-    if (resultLocked && e.target && (e.target.id === 'result-unlock-password' || e.target.closest?.('#result-unlock-panel'))) {
-      return;
-    }
-
-    const k = e.key || '';
-
-    // The browser/OS owns a few keys (especially the Windows key, some
-    // system shortcuts, and the browser's Escape fullscreen exit). JavaScript
-    // cannot guarantee interception of those at OS level. For every key the
-    // page receives, however, block default browser/page behavior and use
-    // printable characters only as the hidden password candidate.
-    if (!e.ctrlKey && !e.altKey && !e.metaKey){
-      if (k === 'Backspace') {
-        unlockBuffer = unlockBuffer.slice(0, -1);
-      } else if (k === 'Escape') {
-        unlockBuffer = '';
-      } else if (k.length === 1) {
-        unlockBuffer += k;
-        if (unlockBuffer.length > 128) unlockBuffer = '';
+  // =====================================================
+  // TOTAL PHYSICAL-KEYBOARD LOCK
+  // From the moment the student presses Start, EVERY key is swallowed - there
+  // is no hidden password buffer any more. After the exam the student gets the
+  // ON-SCREEN keyboard page (see KEYBOARD_GATE_SCRIPT) to enter the unlock
+  // password with the mouse only.
+  // =====================================================
+  let hardLock = false;
+  function tryKeyboardLock(){
+    // Chromium (Edge/Chrome) in fullscreen: also capture keys such as Esc,
+    // Alt+Tab and the Windows key where the OS allows it. Best effort.
+    try{
+      if (navigator.keyboard && navigator.keyboard.lock) {
+        navigator.keyboard.lock().catch(()=>{});
       }
-      clearTimeout(unlockCheckTimer);
-      if (unlockBuffer) unlockCheckTimer = setTimeout(checkKeyboardPassword, 300);
-    }
+    }catch(e){}
+  }
+  document.addEventListener('fullscreenchange', () => { if (hardLock && isFullscreen()) tryKeyboardLock(); });
 
+  function keyboardLockdown(e){
+    if (!(examStarted || hardLock)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
     e.stopPropagation();
     return false;
   }
+  ['keydown','keypress','keyup'].forEach(t => {
+    window.addEventListener(t, keyboardLockdown, true);
+    document.addEventListener(t, keyboardLockdown, true);
+  });
+  ['paste','copy','cut'].forEach(t => document.addEventListener(t, e => {
+    if (examStarted || hardLock) { e.preventDefault(); }
+  }, true));
 
-  document.addEventListener('keydown', keyboardLockdown, true);
-  document.addEventListener('keypress', keyboardLockdown, true);
-  document.addEventListener('keyup', keyboardLockdown, true);
+  // Block the browser Back button during/after the exam.
+  try { history.pushState(null, '', location.href); } catch(e) {}
+  window.addEventListener('popstate', () => {
+    if (examStarted || hardLock) { try { history.pushState(null, '', location.href); } catch(e) {} }
+  });
 })();
 </script>
+"""
+
+
+
+# ============================================================
+# POST-EXAM KEYBOARD GATE (on-screen keyboard)
+# ============================================================
+# Shown right after an exam ends (submitted, time over, or terminated for
+# malpractice) and on every student page until the student unlocks. The
+# physical keyboard is completely swallowed; the unlock password is entered by
+# clicking the on-screen keys with the mouse. The result is NEVER shown to the
+# student - only the examiner can see it.
+
+KEYBOARD_GATE_SCRIPT = r"""
+<style>
+#kb-gate{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(1200px 700px at 15% 10%,rgba(124,92,255,.35),transparent 60%),
+             radial-gradient(1000px 600px at 90% 95%,rgba(255,137,179,.22),transparent 60%),#070a14;
+  font-family:'Segoe UI',system-ui,Arial,sans-serif;color:#eef0fb;user-select:none;-webkit-user-select:none;overflow:auto}
+#kb-gate *{box-sizing:border-box}
+#kb-card{width:min(880px,94vw);margin:18px;padding:26px 28px 24px;border-radius:22px;
+  background:linear-gradient(180deg,rgba(26,31,56,.92),rgba(16,20,38,.94));
+  border:1px solid rgba(157,133,255,.35);box-shadow:0 30px 80px rgba(0,0,0,.55),0 0 0 1px rgba(255,255,255,.04) inset}
+#kb-head{display:flex;align-items:center;gap:16px;margin-bottom:6px}
+#kb-lock{width:58px;height:58px;border-radius:16px;display:grid;place-items:center;font-size:30px;
+  background:linear-gradient(135deg,#7c5cff,#ff89b3);box-shadow:0 10px 30px rgba(124,92,255,.45)}
+#kb-head h1{margin:0;font-size:24px;letter-spacing:-.01em}
+#kb-head p{margin:3px 0 0;color:#a9b0cf;font-size:13.5px}
+#kb-sub{color:#c7ccea;font-size:14px;margin:12px 0 14px;line-height:1.55}
+#kb-status{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:14px;margin-bottom:14px;
+  background:rgba(124,92,255,.10);border:1px solid rgba(157,133,255,.28)}
+#kb-status.ok{background:rgba(74,222,128,.10);border-color:rgba(74,222,128,.40)}
+#kb-status.warn{background:rgba(251,191,36,.10);border-color:rgba(251,191,36,.40)}
+#kb-spin{width:22px;height:22px;border-radius:50%;border:3px solid rgba(255,255,255,.18);border-top-color:#9d85ff;animation:kbspin .8s linear infinite;flex:none}
+#kb-status.ok #kb-spin,#kb-status.warn #kb-spin{animation:none;border-color:transparent;display:grid;place-items:center}
+#kb-status.ok #kb-spin::after{content:"\2714";color:#4ade80;font-size:24px;margin-top:-4px}
+#kb-status.ok #kb-status-text{color:#4ade80;font-size:15px}
+#kb-status.warn #kb-spin::after{content:"!";color:#fbbf24;font-weight:800;font-size:18px;margin-top:-3px}
+@keyframes kbspin{to{transform:rotate(360deg)}}
+#kb-status-text{font-size:14px;font-weight:600}
+#kb-status-detail{font-size:12.5px;color:#a9b0cf;margin-top:2px;font-weight:400}
+#kb-bar{height:5px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin:-4px 0 14px}
+#kb-bar i{display:block;height:100%;width:8%;border-radius:99px;background:linear-gradient(90deg,#7c5cff,#ff89b3);transition:width .6s ease}
+#kb-display{display:flex;align-items:center;justify-content:center;gap:8px;min-height:54px;margin:4px 0 14px;padding:10px 14px;
+  border-radius:14px;background:#0a0e1d;border:1px solid rgba(255,255,255,.12);letter-spacing:.2em;font:700 22px/1 'IBM Plex Mono',ui-monospace,monospace}
+#kb-display.shake{animation:kbshake .4s}
+@keyframes kbshake{0%,100%{transform:translateX(0)}20%{transform:translateX(-9px)}40%{transform:translateX(9px)}60%{transform:translateX(-6px)}80%{transform:translateX(6px)}}
+#kb-display .dot{width:13px;height:13px;border-radius:50%;background:linear-gradient(135deg,#9d85ff,#ff89b3);box-shadow:0 0 10px rgba(157,133,255,.7)}
+#kb-display .ph{color:#6c7494;font:500 14px 'Segoe UI',Arial,sans-serif;letter-spacing:0}
+#kb-keys{display:flex;flex-direction:column;gap:9px;align-items:center}
+.kb-row{display:flex;gap:8px;justify-content:center;flex-wrap:nowrap}
+.kb-key{min-width:clamp(34px,5.4vw,58px);height:clamp(44px,6.2vh,56px);padding:0 10px;border-radius:12px;cursor:pointer;
+  border:1px solid rgba(255,255,255,.14);background:linear-gradient(180deg,#232a4a,#1a2039);color:#eef0fb;font:700 17px 'Segoe UI',Arial,sans-serif;
+  box-shadow:0 3px 0 rgba(0,0,0,.45);transition:transform .06s,background .15s,box-shadow .06s}
+.kb-key:hover{background:linear-gradient(180deg,#2d3560,#212849)}
+.kb-key:active{transform:translateY(2px);box-shadow:0 1px 0 rgba(0,0,0,.45)}
+.kb-key.wide{min-width:clamp(80px,12vw,130px);font-size:14px}
+.kb-key.danger{background:linear-gradient(180deg,#5a2431,#40192a);border-color:rgba(248,113,113,.4)}
+#kb-unlock{margin-top:6px;min-width:min(420px,80vw);height:54px;font-size:17px;border:0;color:#fff;
+  background:linear-gradient(135deg,#7c5cff,#ff6fa4);box-shadow:0 12px 30px rgba(124,92,255,.45)}
+#kb-gate.locked .kb-key,#kb-gate.locked #kb-unlock{opacity:.38;cursor:not-allowed;pointer-events:none;filter:grayscale(.6)}
+#kb-hint{margin-top:14px;text-align:center;color:#8d95b8;font-size:12.5px}
+#kb-toast{position:fixed;top:18px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:12px;background:#2c1616;
+  border:1px solid #f87171;color:#fecaca;font:600 13.5px 'Segoe UI',Arial,sans-serif;z-index:2147483647;display:none;max-width:90vw;text-align:center}
+#kb-modal{position:fixed;inset:0;z-index:2147483647;display:none;align-items:center;justify-content:center;background:rgba(3,5,12,.72);backdrop-filter:blur(4px)}
+#kb-modal .box{width:min(430px,90vw);padding:26px;border-radius:18px;text-align:center;background:#171c33;border:1px solid rgba(248,113,113,.55);
+  box-shadow:0 24px 70px rgba(0,0,0,.6)}
+#kb-modal .ic{font-size:40px;margin-bottom:6px}
+#kb-modal h2{margin:0 0 8px;font-size:20px;color:#fecaca}
+#kb-modal p{margin:0 0 18px;color:#c7ccea;font-size:14px;line-height:1.55}
+#kb-modal button{border:0;border-radius:12px;padding:11px 28px;font:700 14.5px 'Segoe UI',Arial,sans-serif;color:#fff;cursor:pointer;background:linear-gradient(135deg,#7c5cff,#ff6fa4)}
+#kb-modal.good .box{border-color:rgba(74,222,128,.55)}#kb-modal.good h2{color:#86efac}
+</style>
+<div id="kb-gate" class="locked">
+  <div id="kb-card">
+    <div id="kb-head">
+      <div id="kb-lock">&#128274;</div>
+      <div><h1 id="kb-title">Keyboard Locked</h1><p id="kb-sub-head">Your examination session has ended</p></div>
+    </div>
+    <div id="kb-sub"></div>
+    <div id="kb-status"><div id="kb-spin"></div><div><div id="kb-status-text">Checking your recording&hellip;</div><div id="kb-status-detail"></div></div></div>
+    <div id="kb-bar"><i></i></div>
+    <div id="kb-display"><span class="ph">Type the unlock password with the on-screen keys</span></div>
+    <div id="kb-keys">
+      <div class="kb-row" data-row="0"></div>
+      <div class="kb-row" data-row="1"></div>
+      <div class="kb-row" data-row="2"></div>
+      <div class="kb-row" data-row="3"></div>
+      <button class="kb-key" id="kb-unlock" type="button">&#128275; Unlock Keyboard</button>
+    </div>
+    <div id="kb-hint">The physical keyboard is disabled. Use only your mouse. Letters A&ndash;Z only.</div>
+  </div>
+</div>
+<div id="kb-toast"></div>
+<div id="kb-modal"><div class="box"><div class="ic" id="kb-modal-ic">&#9888;&#65039;</div><h2 id="kb-modal-title"></h2><p id="kb-modal-msg"></p><button id="kb-modal-ok" type="button">OK</button></div></div>
+<script>
+(() => {
+  const CFG = __KB_CONFIG__;
+  const gate = document.getElementById('kb-gate');
+  const display = document.getElementById('kb-display');
+  const statusBox = document.getElementById('kb-status');
+  const statusText = document.getElementById('kb-status-text');
+  const statusDetail = document.getElementById('kb-status-detail');
+  const bar = document.querySelector('#kb-bar i');
+  const toast = document.getElementById('kb-toast');
+  const modal = document.getElementById('kb-modal');
+  let typed = '';
+  let ready = !!CFG.alreadyReady;
+  let unlocking = false;
+  let unlocked = false;
+  let blockedUntil = 0;
+  let lastToast = 0;
+
+  document.getElementById('kb-sub').textContent = CFG.message || '';
+  if (CFG.subjectName) {
+    document.getElementById('kb-sub-head').textContent = CFG.subjectName + ' — exam ended';
+  }
+
+  // ---- hard physical keyboard lock -------------------------------------
+  function swallow(e){
+    if (unlocked) return;
+    e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
+    if (e.type === 'keydown' && Date.now() - lastToast > 2500) {
+      lastToast = Date.now();
+      showToast('Physical keyboard is locked. Use the on-screen keyboard with your mouse.');
+    }
+    return false;
+  }
+  ['keydown','keyup','keypress','beforeinput','textInput','compositionstart','compositionupdate','paste','copy','cut'].forEach(t => {
+    window.addEventListener(t, swallow, true);
+    document.addEventListener(t, swallow, true);
+  });
+  document.addEventListener('contextmenu', e => e.preventDefault(), true);
+  document.addEventListener('selectstart', e => e.preventDefault(), true);
+  document.addEventListener('dragstart', e => e.preventDefault(), true);
+  try { history.pushState(null, '', location.href); } catch(e) {}
+  window.addEventListener('popstate', () => { if (!unlocked) { try { history.pushState(null, '', location.href); } catch(e) {} } });
+
+  function tryFullscreenAndLock(){
+    const el = document.documentElement;
+    const fs = document.fullscreenElement || document.webkitFullscreenElement;
+    const lock = () => { try { if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(()=>{}); } catch(e) {} };
+    if (!fs && el.requestFullscreen) { el.requestFullscreen().then(lock).catch(lock); }
+    else { lock(); }
+  }
+  gate.addEventListener('pointerdown', () => { if (!unlocked) tryFullscreenAndLock(); }, true);
+  tryFullscreenAndLock();
+  window.addEventListener('beforeunload', e => { if (!unlocked && !window.__kbAllowUnload) { e.preventDefault(); e.returnValue = ''; } });
+
+  // ---- on-screen keyboard ----------------------------------------------
+  const ROWS = ['QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'];
+  ROWS.forEach((letters, i) => {
+    const row = document.querySelector('.kb-row[data-row="' + i + '"]');
+    letters.split('').forEach(ch => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'kb-key'; b.textContent = ch; b.dataset.k = ch;
+      b.tabIndex = -1;
+      b.addEventListener('click', () => press(ch));
+      row.appendChild(b);
+    });
+  });
+  const last = document.querySelector('.kb-row[data-row="3"]');
+  const back = document.createElement('button');
+  back.type = 'button'; back.className = 'kb-key wide danger'; back.textContent = '⌫ Backspace'; back.tabIndex = -1;
+  back.addEventListener('click', () => { if (!ready) return; typed = typed.slice(0, -1); render(); });
+  const clear = document.createElement('button');
+  clear.type = 'button'; clear.className = 'kb-key wide danger'; clear.textContent = 'Clear'; clear.tabIndex = -1;
+  clear.addEventListener('click', () => { if (!ready) return; typed = ''; render(); });
+  last.appendChild(back); last.appendChild(clear);
+  document.getElementById('kb-unlock').tabIndex = -1;
+  document.getElementById('kb-unlock').addEventListener('click', submitUnlock);
+
+  function press(ch){
+    if (!ready || unlocked) return;
+    if (typed.length >= 40) return;
+    typed += ch;
+    render();
+  }
+  function render(){
+    display.innerHTML = '';
+    if (!typed) {
+      const ph = document.createElement('span'); ph.className = 'ph';
+      ph.textContent = ready ? 'Type the unlock password with the on-screen keys' : 'Waiting for your recording to finish uploading…';
+      display.appendChild(ph); return;
+    }
+    for (let i = 0; i < typed.length; i++) { const d = document.createElement('i'); d.className = 'dot'; display.appendChild(d); }
+  }
+  function showToast(msg){
+    toast.textContent = msg; toast.style.display = 'block';
+    clearTimeout(showToast._t); showToast._t = setTimeout(() => { toast.style.display = 'none'; }, 2600);
+  }
+  function showModal(kind, title, msg, onOk){
+    const m = modal;
+    m.className = kind === 'good' ? 'good' : '';
+    document.getElementById('kb-modal-ic').textContent = kind === 'good' ? '✅' : '⚠️';
+    document.getElementById('kb-modal-title').textContent = title;
+    document.getElementById('kb-modal-msg').textContent = msg;
+    m.style.display = 'flex';
+    const ok = document.getElementById('kb-modal-ok');
+    ok.onclick = () => { m.style.display = 'none'; if (onOk) onOk(); };
+  }
+
+  async function submitUnlock(){
+    if (!ready || unlocking || unlocked) return;
+    if (Date.now() < blockedUntil) {
+      showModal('bad', 'Too many attempts', 'Please wait ' + Math.ceil((blockedUntil - Date.now()) / 1000) + ' seconds before trying again.');
+      return;
+    }
+    if (!typed) { showModal('bad', 'Enter the password', 'Click the letters on the on-screen keyboard to type the unlock password.'); return; }
+    unlocking = true;
+    try {
+      const r = await fetch(CFG.unlockUrl, {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: typed, exam_id: CFG.examId})
+      });
+      const d = await r.json().catch(() => ({}));
+      if (d && d.unlocked) {
+        unlocked = true;
+        window.__kbAllowUnload = true;
+        gate.classList.remove('locked');
+        document.getElementById('kb-title').textContent = 'Keyboard Unlocked';
+        document.getElementById('kb-lock').innerHTML = '&#128275;';
+        showModal('good', 'Keyboard unlocked', 'Your keyboard is available again.', () => {
+          if (CFG.redirectUrl && location.pathname !== CFG.redirectUrl) location.href = CFG.redirectUrl;
+          else { const g = document.getElementById('kb-gate'); if (g) g.remove(); modal.style.display = 'none'; }
+        });
+        return;
+      }
+      typed = ''; render();
+      display.classList.remove('shake'); void display.offsetWidth; display.classList.add('shake');
+      if (r.status === 429 || (d && d.retry_after)) {
+        blockedUntil = Date.now() + (d.retry_after || 30) * 1000;
+        showModal('bad', 'Too many wrong attempts', 'The keyboard stays locked. Try again in ' + (d.retry_after || 30) + ' seconds.');
+      } else if (d && d.reason === 'recording_pending') {
+        showModal('bad', 'Please wait', 'Your exam recording is still being uploaded. The keyboard can be unlocked as soon as it finishes.');
+      } else {
+        showModal('bad', 'Incorrect password', 'The password you entered is wrong. The keyboard remains locked. Please try again.');
+      }
+    } catch (e) {
+      showModal('bad', 'Could not verify', 'The server could not be reached. Check the connection and try again.');
+    } finally { unlocking = false; }
+  }
+
+  // ---- recording status ------------------------------------------------
+  const STEP_TEXT = {
+    none:      ['Exam submitted', 'No recording was produced for this attempt.', 100],
+    processing:['Uploading video to admin…', 'Receiving the last part of your exam video.', 25],
+    assembling:['Uploading video to admin…', 'Preparing the video file.', 45],
+    uploading: ['Uploading video to admin…', 'Sending it to the examiner. Please keep this window open.', 70],
+    done:      ['\u2714 Video uploaded successfully to admin', 'Your recording has reached the examiner. You can now unlock the keyboard.', 100],
+    failed:    ['Recording upload is still retrying', 'It continues in the background. You can unlock the keyboard now.', 100]
+  };
+  function setProgress(p){ bar.style.width = Math.max(6, Math.min(100, p)) + '%'; }
+  function applyStatus(s){
+    const st = s && s.state ? s.state : 'processing';
+    const t = STEP_TEXT[st] || STEP_TEXT.processing;
+    statusText.textContent = t[0];
+    statusDetail.textContent = (s && s.detail) ? s.detail : t[1];
+    setProgress(t[2]);
+    statusBox.className = (st === 'done' || st === 'none') ? 'ok' : (st === 'failed' ? 'warn' : '');
+    const nowReady = !!(s && s.ready);
+    if (nowReady && !ready) { ready = true; gate.classList.remove('locked'); render(); }
+  }
+  async function pollStatus(){
+    if (unlocked) return;
+    try {
+      const r = await fetch(CFG.statusUrl + '?t=' + Date.now(), {credentials: 'same-origin', cache: 'no-store'});
+      if (r.ok) applyStatus(await r.json());
+    } catch (e) {}
+    if (!ready) setTimeout(pollStatus, 1500);
+  }
+  if (CFG.alreadyReady) {
+    gate.classList.remove('locked');
+    statusBox.style.display = 'none'; document.getElementById('kb-bar').style.display = 'none';
+    render();
+  } else {
+    gate.classList.add('locked');
+    render();
+    pollStatus();
+  }
+})();
+</script>
+"""
+
+
+EXAM_DONE_TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exam Submitted</title>
+<style>html,body{margin:0;height:100%;background:#070a14;color:#eef0fb;font-family:'Segoe UI',system-ui,Arial,sans-serif}</style>
+</head>
+<body>
+__GATE__
+</body>
+</html>
 """
 
 
@@ -5955,6 +7175,396 @@ body::after {
 
 
 
+# ============================================================
+# EXAM CLOCK, FORFEITS, DONE PAGE, LIVE SESSION LIST, STRAY-TEXT CLEANUP
+# ============================================================
+EXAM_BEGIN_TIMES = {}
+EXAM_BEGIN_LOCK = threading.Lock()
+
+
+@app.route("/student/exam/<exam_id>/begin", methods=["POST"])
+@student_login_required
+def exam_begin(exam_id):
+    """Called when the student presses Start. The clock lives on the server so a
+    page refresh can never give extra time."""
+    if str(exam_id) != str(session.get("current_exam_id", "")):
+        return jsonify({"success": False, "error": "Invalid exam"}), 403
+    try:
+        duration = int(session.get("current_exam_duration_minutes", 30) or 30)
+    except (TypeError, ValueError):
+        duration = 30
+    key = _rec_key(session.get("student_id", ""), exam_id)
+    with EXAM_BEGIN_LOCK:
+        begun = EXAM_BEGIN_TIMES.setdefault(key, time.time())
+    remaining = max(0, int(duration * 60 - (time.time() - begun)))
+    return jsonify({"success": True, "remaining_seconds": remaining})
+
+
+def _record_forfeit(student_id, student_name, student_email, exam_id, status_label):
+    """Close an attempt whose time ran out while the student was away."""
+    try:
+        wb = load_database()
+        subject_name = subject_code = ""
+        for row in wb["Exams"].iter_rows(min_row=2, values_only=True):
+            if row[0] == exam_id:
+                subject_name, subject_code = row[3], row[4]
+                break
+        result_sheet, _details = _ensure_results_schema(wb)
+        result_id = "R" + uuid.uuid4().hex[:10].upper()
+        submitted_at = _now_local().strftime("%Y-%m-%d %H:%M:%S")
+        _append_result_by_header(result_sheet, {
+            "Result ID": result_id, "Student ID": student_id, "Student Name": student_name,
+            "Student Email": student_email, "Exam ID": exam_id, "Subject Name": subject_name,
+            "Subject Code": subject_code, "Total Questions": 0, "Correct Answers": 0,
+            "Wrong Answers": 0, "Score": "0/0", "Percentage": 0, "Recording File": "",
+            "Exam Status": status_label, "Unattempted Answers": 0, "Submitted At": submitted_at,
+        })
+        save_database(wb)
+        wb.close()
+    except Exception as exc:
+        print("Forfeit record error:", exc)
+
+
+def _render_exam_done(exam_id, subject_name, exam_status):
+    """Page shown after an exam ends. NO score is shown - only the on-screen
+    keyboard gate that must be unlocked with the examiner's password."""
+    sid = session.get("student_id", "")
+    cfg = {
+        "examId": exam_id,
+        "statusUrl": "/student/exam/" + str(exam_id) + "/recording-status",
+        "unlockUrl": "/student/exam/keyboard-unlock",
+        "redirectUrl": "/student/dashboard",
+        "message": "Your exam has ended. Enter the unlock password on the on-screen keyboard to continue.",
+        "subjectName": subject_name or "",
+        "alreadyReady": _recording_ready(sid, exam_id),
+    }
+    gate = KEYBOARD_GATE_SCRIPT.replace("__KB_CONFIG__", json.dumps(cfg))
+    resp = app.make_response(EXAM_DONE_TEMPLATE.replace("__GATE__", gate))
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/internal/live-sessions")
+def internal_live_sessions():
+    """Token-protected list of students currently taking an exam. The admin
+    server pulls this so the live wall works even if a push was missed."""
+    if not LIVE_SYNC_TOKEN or request.headers.get("X-ExamGuard-Sync-Token", "") != LIVE_SYNC_TOKEN:
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    sessions = []
+    now = time.time()
+    try:
+        for name in os.listdir(LIVE_FRAMES_FOLDER):
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(LIVE_FRAMES_FOLDER, name), "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            age = now - float(data.get("last_seen", 0) or 0)
+            if age > 30:
+                continue
+            data["age"] = round(age, 2)
+            data.update(_live_violation_fields(data.get("student_id", "")))
+            sessions.append(data)
+    except Exception as exc:
+        print("live-sessions error:", exc)
+    return jsonify({"success": True, "sessions": sessions, "server_time": now})
+
+
+STRAY_TEXT_CLEANUP = r"""
+<script id="ai-stray-clean">
+(function(){
+  // Removes loose text such as "html" or ";;;(}}" that leaks into the page
+  // when stylesheet/markup fragments are mis-parsed. Only text nodes made
+  // purely of code punctuation or the bare word "html" are touched.
+  var BAD = /^\s*(html|[;{}()\[\]\s]+)\s*$/i;
+  function clean(){
+    try{
+      var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      var drop = [], n;
+      while ((n = w.nextNode())) {
+        var p = n.parentNode && n.parentNode.nodeName;
+        if (p === 'SCRIPT' || p === 'STYLE' || p === 'TEXTAREA' || p === 'NOSCRIPT') continue;
+        if (n.nodeValue && n.nodeValue.trim() && BAD.test(n.nodeValue)) drop.push(n);
+      }
+      drop.forEach(function(t){ t.parentNode && t.parentNode.removeChild(t); });
+    }catch(e){}
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', clean); else clean();
+  setTimeout(clean, 400);
+})();
+</script>
+"""
+
+
+
+# ============================================================
+# ZOOM LOCK (all pages): the page always stays at 100 %
+# ============================================================
+ZOOM_LOCK_SNIPPET = r"""<!--eg-zoom-lock--><script>
+(function(){
+  function stop(e){ try{ e.preventDefault(); e.stopPropagation(); }catch(x){} }
+  // Ctrl + mouse wheel / touchpad pinch
+  window.addEventListener('wheel', function(e){ if (e.ctrlKey || e.metaKey) stop(e); }, {passive:false, capture:true});
+  // Ctrl + / Ctrl - / Ctrl 0 (also the number pad)
+  window.addEventListener('keydown', function(e){
+    if (!(e.ctrlKey || e.metaKey)) return;
+    var k = e.key, c = e.code;
+    if (k==='+'||k==='-'||k==='='||k==='_'||k==='0'||k==='Add'||k==='Subtract'||
+        c==='Equal'||c==='Minus'||c==='Digit0'||c==='NumpadAdd'||c==='NumpadSubtract'||c==='Numpad0') stop(e);
+  }, true);
+  // Pinch on touch screens / Safari gestures
+  ['gesturestart','gesturechange','gestureend'].forEach(function(n){ document.addEventListener(n, stop, {passive:false}); });
+  document.addEventListener('touchmove', function(e){ if (e.touches && e.touches.length > 1) stop(e); }, {passive:false});
+  // Zoom changed from the browser menu cannot be blocked, so cancel it by
+  // scaling the page back to the size it had when it opened.
+  var STEPS=[.25,.33,.5,.67,.75,.8,.9,1,1.1,1.25,1.5,1.75,2,2.5,3,4,5];
+  function browserZoom(){
+    var o=window.outerWidth, i=window.innerWidth;
+    if(!o||!i) return 1;
+    var r=o/i, best=1, d=9;
+    STEPS.forEach(function(s){ var x=Math.abs(r-s)/s; if(x<d){d=x;best=s;} });
+    return d<0.06 ? best : 1;
+  }
+  function compensate(){
+    var z=browserZoom(), root=document.documentElement;
+    if (Math.abs(z-1) < 0.02) { if (root.style.zoom) root.style.zoom = ''; }
+    else { root.style.zoom = String(1/z); }
+  }
+  compensate();
+  window.addEventListener('resize', compensate);
+  setInterval(compensate, 400);
+})();
+</script>"""
+
+
+@app.after_request
+def eg_zoom_lock(response):
+    try:
+        if (request.method == "GET" and response.status_code == 200
+                and "text/html" in (response.content_type or "") and not response.is_streamed):
+            body = response.get_data(as_text=True)
+            if "eg-zoom-lock" in body:
+                return response
+            body = body.replace('content="width=device-width, initial-scale=1"',
+                                'content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"')
+            import re as _re_zoom
+            m = _re_zoom.search(r"<head[^>]*>", body, _re_zoom.I)
+            if m:
+                body = body[:m.end()] + ZOOM_LOCK_SNIPPET + body[m.end():]
+            elif "</body>" in body:
+                body = body.replace("</body>", ZOOM_LOCK_SNIPPET + "</body>")
+            else:
+                body = ZOOM_LOCK_SNIPPET + body
+            response.set_data(body)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("[UI] zoom lock skipped:", exc)
+    return response
+
+
+# ============================================================
+# 3D LOOK (all normal pages): depth layers, tilting glass cards, 3D buttons
+# ------------------------------------------------------------
+# Injected just before </body> so it works for every page without touching the
+# templates. It is skipped on exam / live-monitoring / video pages so the
+# camera, recording and live wall keep all the computer's power.
+# ============================================================
+EG_3D_SNIPPET = r"""<!--eg-3d-look--><style id="eg3d-css">
+body::before,body::after{opacity:0 !important}
+html{background-color:#0a0e1a;min-height:100%}body{min-height:100vh}
+#eg3d-scene{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden;perspective:1100px;perspective-origin:50% 38%}
+.eg3d-orb{position:absolute;transform:translate3d(calc(var(--mx,0)*var(--d,20)*1px),calc(var(--my,0)*var(--d,20)*1px),0)}
+.eg3d-orb>i{display:block;width:100%;height:100%;border-radius:50%;
+  background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.60) 0,rgba(205,190,255,.38) 14%,rgba(124,92,255,.30) 42%,rgba(60,40,150,.10) 66%,rgba(20,10,70,0) 74%);
+  box-shadow:inset -14px -18px 46px rgba(15,8,60,.60),0 34px 90px rgba(124,92,255,.22);
+  animation:egFloat var(--t,14s) ease-in-out infinite alternate}
+.eg3d-orb.pink>i{background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.55) 0,rgba(255,200,225,.34) 14%,rgba(255,111,164,.26) 42%,rgba(120,30,90,.10) 66%,rgba(40,10,40,0) 74%);box-shadow:inset -14px -18px 46px rgba(60,8,40,.55),0 34px 90px rgba(255,111,164,.18)}
+.eg3d-orb.blue>i{background:radial-gradient(circle at 32% 26%,rgba(255,255,255,.55) 0,rgba(190,225,255,.34) 14%,rgba(79,160,255,.26) 42%,rgba(20,60,130,.10) 66%,rgba(10,20,60,0) 74%);box-shadow:inset -14px -18px 46px rgba(8,25,70,.55),0 34px 90px rgba(79,160,255,.18)}
+@keyframes egFloat{0%{transform:translate3d(0,0,0) scale(1)}100%{transform:translate3d(0,-34px,0) scale(1.05)}}
+.eg3d-cube{position:absolute;width:var(--s,120px);height:var(--s,120px);transform-style:preserve-3d;
+  animation:egSpin var(--t,32s) linear infinite;opacity:.85}
+.eg3d-cube-wrap{position:absolute;transform:translate3d(calc(var(--mx,0)*var(--d,40)*1px),calc(var(--my,0)*var(--d,40)*1px),0);transform-style:preserve-3d}
+.eg3d-cube b{position:absolute;inset:0;border:1px solid rgba(180,160,255,.42);background:linear-gradient(135deg,rgba(124,92,255,.10),rgba(255,111,164,.05));box-shadow:inset 0 0 24px rgba(124,92,255,.18)}
+.eg3d-cube b:nth-child(1){transform:rotateY(0) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(2){transform:rotateY(90deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(3){transform:rotateY(180deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(4){transform:rotateY(270deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(5){transform:rotateX(90deg) translateZ(calc(var(--s,120px)/2))}
+.eg3d-cube b:nth-child(6){transform:rotateX(-90deg) translateZ(calc(var(--s,120px)/2))}
+@keyframes egSpin{from{transform:rotateX(-24deg) rotateY(0)}to{transform:rotateX(-24deg) rotateY(360deg)}}
+.eg3d-ring{position:absolute;border-radius:50%;border:2px solid rgba(157,133,255,.34);box-shadow:0 0 30px rgba(124,92,255,.25),inset 0 0 30px rgba(124,92,255,.18);
+  transform:rotateX(68deg);animation:egRing var(--t,18s) linear infinite}
+@keyframes egRing{from{transform:rotateX(68deg) rotateZ(0)}to{transform:rotateX(68deg) rotateZ(360deg)}}
+
+.eg3d-card{transform-style:preserve-3d;transition:transform .22s ease,box-shadow .25s ease;will-change:transform;animation:egCardIn .75s cubic-bezier(.2,.8,.2,1) backwards}
+.eg3d-card.eg3d-hot{box-shadow:0 26px 60px rgba(0,0,0,.50),0 0 0 1px rgba(157,133,255,.38),0 0 44px rgba(124,92,255,.22) !important}
+.eg3d-card>h1,.eg3d-card>h2,.eg3d-card>h3{transform:translateZ(26px)}
+@keyframes egCardIn{from{opacity:0;transform:perspective(900px) rotateX(16deg) translateY(36px) scale(.97)}to{opacity:1;transform:perspective(900px) rotateX(0) translateY(0) scale(1)}}
+.eg3d-glare{position:absolute;inset:0;border-radius:inherit;pointer-events:none;opacity:0;transition:opacity .25s ease;
+  background:radial-gradient(circle at var(--gx,50%) var(--gy,0%),rgba(255,255,255,.17),rgba(255,255,255,0) 52%);z-index:2}
+.eg3d-card.eg3d-hot>.eg3d-glare{opacity:1}
+
+h1{filter:drop-shadow(0 6px 14px rgba(124,92,255,.32))}
+button,.xbtn,input[type=submit],a.btn{transition:transform .15s ease,box-shadow .15s ease,filter .15s ease}
+button:not(:disabled):hover,.xbtn:hover,input[type=submit]:hover,a.btn:hover{transform:translateY(-2px);filter:brightness(1.07);box-shadow:0 6px 0 -1px rgba(0,0,0,.38),0 16px 26px rgba(0,0,0,.38)}
+button:not(:disabled):active,.xbtn:active,input[type=submit]:active,a.btn:active{transform:translateY(1px);box-shadow:0 1px 0 rgba(0,0,0,.4)}
+tbody tr{transition:background .2s ease}
+tbody tr:hover{background:rgba(157,133,255,.07)}
+@media (prefers-reduced-motion:reduce){.eg3d-orb>i,.eg3d-cube,.eg3d-ring,.eg3d-card{animation:none !important}}
+</style>
+<script>
+(function(){
+  try{
+    var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var touch = window.matchMedia && matchMedia('(hover: none)').matches;
+    var body = document.body; if(!body || document.getElementById('eg3d-scene')) return;
+
+    // ---- background depth scene ----
+    var scene = document.createElement('div'); scene.id = 'eg3d-scene';
+    function orb(cls,l,t,sz,d,tm){ var o=document.createElement('div'); o.className='eg3d-orb '+cls;
+      o.style.cssText='left:'+l+';top:'+t+';width:'+sz+'px;height:'+sz+'px;--d:'+d+';--t:'+tm+'s'; o.appendChild(document.createElement('i')); scene.appendChild(o); }
+    orb('','6%','14%',150,34,13); orb('pink','82%','10%',110,22,16); orb('blue','90%','62%',190,46,12);
+    orb('','12%','72%',210,50,15); orb('pink','46%','84%',90,18,11); orb('blue','70%','30%',70,14,17);
+    function cube(l,t,s,d,tm){ var w=document.createElement('div'); w.className='eg3d-cube-wrap'; w.style.cssText='left:'+l+';top:'+t+';--d:'+d;
+      var c=document.createElement('div'); c.className='eg3d-cube'; c.style.cssText='--s:'+s+'px;--t:'+tm+'s';
+      for(var i=0;i<6;i++) c.appendChild(document.createElement('b')); w.appendChild(c); scene.appendChild(w); }
+
+    // ---- neon tunnel (canvas, light: half resolution, ~30 fps, pauses when hidden) ----
+    var cv=document.createElement('canvas'); cv.id='eg3d-tunnel';
+    cv.style.cssText='position:absolute;inset:0;width:100%;height:100%;opacity:.9';
+    scene.appendChild(cv);
+    var shade=document.createElement('div');
+    shade.style.cssText='position:absolute;inset:0;background:radial-gradient(ellipse at center,rgba(6,8,22,.55) 0%,rgba(6,8,22,.78) 62%,rgba(4,5,14,.93) 100%)';
+    scene.appendChild(shade);
+    (function(){
+      var ctx=cv.getContext('2d'); if(!ctx) return;
+      var W=0,H=0,t=0,last=0,cx=0,cy=0,tx=0,ty=0,run=true;
+      function size(){ W=cv.width=Math.max(320,Math.floor(window.innerWidth/2)); H=cv.height=Math.max(200,Math.floor(window.innerHeight/2)); }
+      size(); window.addEventListener('resize',size);
+      if(!reduce && !touch) window.addEventListener('pointermove',function(e){ tx=(e.clientX/window.innerWidth-.5)*0.18; ty=(e.clientY/window.innerHeight-.5)*0.18; },{passive:true});
+      document.addEventListener('visibilitychange',function(){ run=!document.hidden; if(run) requestAnimationFrame(frame); });
+      var N=16, SPOKES=12;
+      function frame(ts){
+        if(!run) return;
+        requestAnimationFrame(frame);
+        if(ts-last<33) return; last=ts;
+        var dt=reduce?0:0.011; t+=dt; cx+=(tx-cx)*.06; cy+=(ty-cy)*.06;
+        ctx.fillStyle='#050714'; ctx.fillRect(0,0,W,H);
+        var ox=W/2+cx*W, oy=H/2+cy*H, maxR=Math.hypot(W,H)*.62;
+        ctx.lineCap='round';
+        // spokes
+        ctx.lineWidth=1;
+        for(var s=0;s<SPOKES;s++){
+          var a=s/SPOKES*Math.PI*2+t*.18;
+          ctx.strokeStyle='rgba('+(s%2?'255,60,200':'40,200,255')+',.22)';
+          ctx.beginPath(); ctx.moveTo(ox+Math.cos(a)*maxR*.05,oy+Math.sin(a)*maxR*.05); ctx.lineTo(ox+Math.cos(a)*maxR,oy+Math.sin(a)*maxR); ctx.stroke();
+        }
+        // rings (far to near)
+        for(var i=N;i>=0;i--){
+          var z=(i+(t*3)%1)/N;            // 0 near .. 1 far
+          var p=Math.pow(1-z,2.2);        // perspective
+          var r=maxR*p+4; if(r<3) continue;
+          var alpha=Math.min(1,(1-z)*1.6)*.9;
+          var hue=(i%2)?'255,60,200':'40,200,255';
+          ctx.save(); ctx.translate(ox,oy); ctx.rotate(t*.35*(i%2?1:-1)+i*.12);
+          ctx.lineWidth=Math.max(1,r*.018);
+          ctx.strokeStyle='rgba('+hue+','+alpha.toFixed(3)+')';
+          ctx.shadowColor='rgba('+hue+',.9)'; ctx.shadowBlur=10;
+          ctx.beginPath();
+          if(i%3===0){ // rounded square ring
+            var q=r*.78; ctx.rect(-q,-q,q*2,q*2);
+          } else { ctx.arc(0,0,r,0,Math.PI*2); }
+          ctx.stroke();
+          // pulsing dashes on circles
+          if(i%3===1){ ctx.setLineDash([r*.18,r*.5]); ctx.lineDashOffset=-t*r*2; ctx.lineWidth=Math.max(1.5,r*.03); ctx.beginPath(); ctx.arc(0,0,r*.86,0,Math.PI*2); ctx.stroke(); ctx.setLineDash([]); }
+          ctx.restore();
+        }
+        ctx.shadowBlur=0;
+      }
+      requestAnimationFrame(frame);
+    })();
+    body.insertBefore(scene, body.firstChild);
+
+    // lift normal page content above the scene (keep fixed/absolute things as they are)
+    Array.prototype.forEach.call(body.children, function(el){
+      if (el === scene || /^(SCRIPT|STYLE|LINK)$/.test(el.tagName)) return;
+      var cs = getComputedStyle(el);
+      if (cs.position === 'static') { el.style.position = 'relative'; }
+      if (cs.zIndex === 'auto') { el.style.zIndex = '1'; }
+    });
+
+    // ---- mouse parallax for the scene ----
+    if (!reduce && !touch) {
+      var mx=0,my=0,ticking=false;
+      window.addEventListener('pointermove', function(e){
+        mx=(e.clientX/window.innerWidth-.5)*2; my=(e.clientY/window.innerHeight-.5)*2;
+        if(!ticking){ ticking=true; requestAnimationFrame(function(){ scene.style.setProperty('--mx',mx.toFixed(3)); scene.style.setProperty('--my',my.toFixed(3)); ticking=false; }); }
+      }, {passive:true});
+    }
+
+    // ---- tilting glass cards ----
+    function isCard(el){
+      var r=el.getBoundingClientRect(); if(r.width<200||r.width>1300||r.height<90) return false;
+      if(el.querySelector('video,canvas,iframe,textarea')) return false;
+      var cs=getComputedStyle(el); var br=parseFloat(cs.borderTopLeftRadius)||0; if(br<10) return false;
+      var hasShadow=cs.boxShadow&&cs.boxShadow!=='none'; var hasBorder=parseFloat(cs.borderTopWidth)>0;
+      var bg=cs.backgroundColor; var hasBg=bg&&bg!=='rgba(0, 0, 0, 0)'&&bg!=='transparent';
+      return hasBg&&(hasShadow||hasBorder);
+    }
+    var cards=[]; var all=document.querySelectorAll('div,section,form,article,main');
+    for(var i=0;i<all.length&&i<600;i++){ var el=all[i]; if(el.closest('#eg3d-scene')||el.closest('.modal-bg')) continue;
+      if(cards.some(function(c){return c.contains(el);})) continue; if(isCard(el)) cards.push(el); }
+    cards.forEach(function(card,idx){
+      card.classList.add('eg3d-card'); card.style.animationDelay=(idx*90)+'ms';
+      if(getComputedStyle(card).position==='static') card.style.position='relative';
+      var g=document.createElement('span'); g.className='eg3d-glare'; card.appendChild(g);
+      if(reduce||touch) return;
+      var raf=0;
+      card.addEventListener('pointermove', function(e){
+        var r=card.getBoundingClientRect(); var px=(e.clientX-r.left)/r.width, py=(e.clientY-r.top)/r.height;
+        var max=r.width>700?2.2:7; var ry=(px-.5)*2*max, rx=-(py-.5)*2*max;
+        if(raf) cancelAnimationFrame(raf);
+        raf=requestAnimationFrame(function(){
+          card.style.setProperty('transform','perspective(900px) rotateX('+rx.toFixed(2)+'deg) rotateY('+ry.toFixed(2)+'deg) translateZ(8px)','important');
+          card.style.setProperty('--gx',(px*100).toFixed(0)+'%'); card.style.setProperty('--gy',(py*100).toFixed(0)+'%');
+          card.classList.add('eg3d-hot');
+        });
+      });
+      card.addEventListener('pointerleave', function(){
+        if(raf) cancelAnimationFrame(raf); card.style.removeProperty('transform'); card.classList.remove('eg3d-hot');
+      });
+    });
+  }catch(err){ if(window.console) console.warn('3D look skipped:', err); }
+})();
+</script>"""
+
+_EG_3D_SKIP_PREFIXES = ("/student/exam", "/admin/live", "/internal", "/admin/recording-stream", "/admin/video", "/admin/voice")
+
+
+@app.after_request
+def eg_3d_effects(response):
+    try:
+        path = request.path or ""
+        if (request.method == "GET" and response.status_code == 200
+                and "text/html" in (response.content_type or "") and not response.is_streamed
+                and not path.startswith(_EG_3D_SKIP_PREFIXES)):
+            body = response.get_data(as_text=True)
+            if "eg-3d-look" in body or "ai-camera-preview" in body:
+                return response
+            if "</body>" in body:
+                body = body.replace("</body>", EG_3D_SNIPPET + "</body>", 1) if body.count("</body>") == 1 else body[:body.rfind("</body>")] + EG_3D_SNIPPET + body[body.rfind("</body>"):]
+            else:
+                body = body + EG_3D_SNIPPET
+            response.set_data(body)
+            response.headers["Content-Length"] = str(len(response.get_data()))
+    except Exception as exc:
+        print("[UI] 3D look skipped:", exc)
+    return response
+
+
+
 @app.after_request
 def inject_student_ui(response):
     try:
@@ -5970,7 +7580,16 @@ def inject_student_ui(response):
             body = response.get_data(as_text=True)
 
             if "ai-camera-preview" not in body and "</body>" in body:
-                body = body.replace("</body>", EXAM_RECORDING_SCRIPT + "</body>")
+                try:
+                    _dur_for_script = int(session.get("current_exam_duration_minutes", 30) or 30)
+                except (TypeError, ValueError):
+                    _dur_for_script = 30
+                _rec_script = (
+                    EXAM_RECORDING_SCRIPT
+                    .replace("__ICE_SERVERS_JSON__", json.dumps(_ice_servers()))
+                    .replace("__EXAM_DURATION_MIN__", str(_dur_for_script))
+                )
+                body = body.replace("</body>", _rec_script + "</body>")
 
             if "ai-fs-start-overlay" not in body and "</body>" in body:
                 body = body.replace("</body>", FULLSCREEN_AUTOEND_SCRIPT + "</body>")
@@ -5984,6 +7603,7 @@ def inject_student_ui(response):
 </style><div id="ai-exam-timer"><span id="ai-exam-timer-label">TIME LEFT</span><span id="ai-exam-timer-value">--:--</span></div><script>(()=>{{
 const totalSeconds={exam_duration}*60;
 let endAt=0;
+let startedSeenAt=0;
 let submitted=false;
 let lastShownSecond=null;
 let audioContext=null;
@@ -6022,7 +7642,12 @@ function timeoutBuzzer(){{
 
 function tick(){{
   if(!window.__aiExamStarted) return;
-  if(!endAt) endAt=Date.now()+totalSeconds*1000;
+  if(!endAt){{
+    if(!startedSeenAt) startedSeenAt=Date.now();
+    if(window.__aiRemainingSeconds===undefined && Date.now()-startedSeenAt<3000) return;
+    const rem=(typeof window.__aiRemainingSeconds==='number')?window.__aiRemainingSeconds:totalSeconds;
+    endAt=Date.now()+Math.min(totalSeconds,Math.max(1,rem))*1000;
+  }}
 
   const left=Math.max(0,Math.ceil((endAt-Date.now())/1000));
   const ratio=totalSeconds>0?left/totalSeconds:0;
@@ -6083,6 +7708,18 @@ setInterval(tick,250);
             and not response.is_streamed
         ):
             body = response.get_data(as_text=True)
+            if session.get("kb_locked") and "kb-gate" not in body and "</body>" in body:
+                _cfg = {
+                    "examId": session.get("kb_locked_exam", ""),
+                    "statusUrl": "/student/exam/" + str(session.get("kb_locked_exam", "")) + "/recording-status",
+                    "unlockUrl": "/student/exam/keyboard-unlock",
+                    "redirectUrl": "/student/dashboard",
+                    "message": "Your exam is over. Unlock the keyboard to continue.",
+                    "alreadyReady": _recording_ready(session.get("student_id", ""), session.get("kb_locked_exam", "")),
+                }
+                body = body.replace("</body>", KEYBOARD_GATE_SCRIPT.replace("__KB_CONFIG__", json.dumps(_cfg)) + "</body>")
+            if "ai-stray-clean" not in body and "</body>" in body:
+                body = body.replace("</body>", STRAY_TEXT_CLEANUP + "</body>")
             if "ai-dashboard-bg-applied" not in body:
                 marker = "<!--ai-dashboard-bg-applied-->"
                 if "</head>" in body:
@@ -6095,6 +7732,19 @@ setInterval(tick,250);
         print("UI injection error:", e)
 
     return response
+
+
+def _bootstrap_for_wsgi():
+    for fn in (initialize_database, _retry_pending_admin_syncs, ensure_recording_column,
+               ensure_exam_status_column, ensure_violations_sheet):
+        try:
+            fn()
+        except Exception as exc:
+            print("[BOOT]", getattr(fn, "__name__", fn), "skipped:", exc)
+
+
+if __name__ != "__main__":
+    _bootstrap_for_wsgi()
 
 
 if __name__ == "__main__":

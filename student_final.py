@@ -4696,16 +4696,6 @@ def exam_violation():
 
 
 
-@app.route("/student/exam/preflight-config")
-@student_login_required
-def preflight_config():
-    """Settings for the pre-exam microphone / volume check popup."""
-    return jsonify({
-        "require_volume": os.environ.get("EXAMGUARD_REQUIRE_VOLUME_CHECK", "1").strip().lower() not in ("0", "false", "no", "off"),
-        "min_tone_db": float(os.environ.get("EXAMGUARD_VOLUME_MIN_DB", "-40")),
-    })
-
-
 @app.route("/student/exam/audio-warning", methods=["POST"])
 @student_login_required
 def audio_warning_event():
@@ -5634,29 +5624,7 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
     font-family:'Segoe UI',Arial,sans-serif;color:#e8eaf0;
 }
 #ai-fs-start-overlay .box{max-width:480px;padding:24px;max-height:96vh;overflow:auto}
-#ai-sc{background:#111827;border:1px solid #27324d;border-radius:12px;padding:14px 16px;margin:0 0 16px;text-align:left}
-#ai-sc .sc-title{font-weight:700;font-size:14px;margin-bottom:10px;color:#e8eaf0}
-#ai-sc .sc-row{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid #1e2740}
-#ai-sc .sc-row:first-of-type{border-top:0}
-#ai-sc .sc-ic{flex:0 0 24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:800;background:#1e2740;color:#8891a8}
-#ai-sc .sc-row.ok .sc-ic{background:#16a34a;color:#fff}
-#ai-sc .sc-row.bad .sc-ic{background:#dc2626;color:#fff}
-#ai-sc .sc-row.run .sc-ic{background:#2563eb;color:#fff;animation:ai-sc-pulse 1s infinite}
-@keyframes ai-sc-pulse{50%{opacity:.45}}
-#ai-sc b{display:block;font-size:13.5px;color:#e8eaf0}
-#ai-sc small{display:block;font-size:12.5px;color:#9aa4bd;line-height:1.5;margin-top:2px}
-#ai-sc .sc-meter{height:6px;border-radius:99px;background:#1e2740;overflow:hidden;margin:8px 0 2px}
-#ai-sc .sc-meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#22c55e,#facc15,#ef4444);transition:width .08s linear}
-#ai-sc select{width:100%;margin-top:8px;background:#0b1220;color:#e8eaf0;border:1px solid #27324d;border-radius:8px;padding:7px;font-size:12.5px}
-#ai-sc-btn{margin-top:10px;width:100%;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:10px;font-weight:700;font-size:14px;cursor:pointer}
-#ai-sc-btn:disabled{opacity:.6;cursor:default}
 #ai-fs-start-btn:disabled{background:#334155;color:#94a3b8;cursor:not-allowed}
-#ai-sc-pop{font-family:'Segoe UI',Arial,sans-serif;position:fixed;inset:0;background:rgba(2,6,18,.78);z-index:2147483640;display:none;align-items:center;justify-content:center}
-#ai-sc-pop.show{display:flex}
-#ai-sc-pop .pbox{width:min(420px,92vw);background:#121a2e;border:1px solid #f59e0b;border-radius:14px;padding:24px;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.6)}
-#ai-sc-pop h2{margin:0 0 10px;font-size:19px;color:#fbbf24}
-#ai-sc-pop p{margin:0 0 16px;font-size:14px;line-height:1.6;color:#d3d9ea}
-#ai-sc-pop button{background:#6366f1;color:#fff;border:0;border-radius:8px;padding:9px 28px;font-weight:700;cursor:pointer}
 #ai-fs-start-overlay .eyebrow{font:600 11.5px monospace;letter-spacing:.08em;
     text-transform:uppercase;color:#5b8cff;margin-bottom:12px}
 #ai-fs-start-overlay h1{font-size:22px;margin:0 0 12px}
@@ -5721,17 +5689,9 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
       &#9888; If you exit fullscreen or switch tabs/windows at any point, your exam will be
       <strong>automatically submitted immediately</strong> with your answers as they are at that moment.
     </div>
-    <div id="ai-sc" style="display:none">
-      <div class="sc-title">Sound &amp; microphone check (required)</div>
-      <div class="sc-row" id="sc-vol"><span class="sc-ic">1</span><div><b>Computer volume at 100%</b><small id="sc-vol-t">Set your computer volume to 100%, then press the button below. A short beep will play and your microphone must hear it.</small></div></div>
-      <div class="sc-row" id="sc-mic"><span class="sc-ic">2</span><div><b>Microphone works</b><small id="sc-mic-t">After the volume check, say &ldquo;I am ready&rdquo; aloud.</small><div class="sc-meter"><i id="sc-meter-i"></i></div></div></div>
-      <select id="sc-dev" style="display:none" title="Microphone"></select>
-      <button type="button" id="ai-sc-btn">Start sound check</button>
-    </div>
-    <button id="ai-fs-start-btn" disabled>Enter Fullscreen &amp; Start Exam</button>
+    <button id="ai-fs-start-btn">Enter Fullscreen &amp; Start Exam</button>
   </div>
 </div>
-<div id="ai-sc-pop"><div class="pbox"><h2 id="ai-sc-pop-t"></h2><p id="ai-sc-pop-m"></p><button type="button" id="ai-sc-pop-ok">OK</button></div></div>
 
 <div id="ai-fs-ending-overlay">
   <div class="box">
@@ -5915,209 +5875,7 @@ FULLSCREEN_AUTOEND_SCRIPT = r"""
   }
 
 
-  // =====================================================
-  // SOUND & MICROPHONE CHECK (must pass before the exam can start)
-  // A web page cannot read the computer's volume setting. So it plays a
-  // short beep through the speakers and measures how loudly the microphone
-  // hears it: that proves the volume is turned up and the microphone works.
-  // The check repeats by itself, so as soon as the student raises the volume
-  // the step turns green. Needs speakers (headphones will not pass).
-  // =====================================================
-  (function soundCheck(){
-    const box = document.getElementById('ai-sc');
-    const scBtn = document.getElementById('ai-sc-btn');
-    const volRow = document.getElementById('sc-vol'), micRow = document.getElementById('sc-mic');
-    const volT = document.getElementById('sc-vol-t'), micT = document.getElementById('sc-mic-t');
-    const meter = document.getElementById('sc-meter-i'), devSel = document.getElementById('sc-dev');
-    const pop = document.getElementById('ai-sc-pop'), popT = document.getElementById('ai-sc-pop-t'), popM = document.getElementById('ai-sc-pop-m');
-    document.getElementById('ai-sc-pop-ok').addEventListener('click', () => { pop.classList.remove('show'); popDismissedAt = Date.now(); });
-    let popDismissedAt = 0;
-    let required = true, minToneDb = -40;
-    let passed = false, running = false, volOk = false, micOk = false;
-    let stream = null, ctx = null, an = null, timer = null, osc = null, gain = null;
-    const TONE_HZ = 1000;
-
-    function setRow(row, state, ic){ row.className = 'sc-row ' + state; row.querySelector('.sc-ic').textContent = ic; }
-    function showPop(title, msg){ popT.textContent = title; popM.textContent = msg; pop.classList.add('show'); }
-    function hidePop(){ pop.classList.remove('show'); }
-
-    // keep the Start button locked until both checks pass
-    function lockStart(msg){ startBtn.disabled = true; startBtn.textContent = msg || 'Complete the sound check to start'; }
-    function unlockStart(){ startBtn.disabled = false; startBtn.innerHTML = 'Enter Fullscreen &amp; Start Exam'; }
-
-    // single-frequency level in dBFS (Goertzel)
-    function toneDb(buf, sr, hz){
-      const n = buf.length, k = Math.round(n * hz / sr), w = 2 * Math.PI * k / n, c = 2 * Math.cos(w);
-      let s0 = 0, s1 = 0, s2 = 0;
-      for (let i = 0; i < n; i++) { s0 = buf[i] + c * s1 - s2; s2 = s1; s1 = s0; }
-      const p = s1 * s1 + s2 * s2 - c * s1 * s2;
-      const amp = 2 * Math.sqrt(Math.max(p, 0)) / n;
-      return 20 * Math.log10(amp + 1e-9);
-    }
-    function rms(buf){ let a = 0; for (let i = 0; i < buf.length; i++) a += buf[i] * buf[i]; return Math.sqrt(a / buf.length); }
-
-    function cleanup(){
-      running = false;
-      if (timer) { clearInterval(timer); timer = null; }
-      try { if (osc) osc.stop(); } catch(e) {}
-      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch(e) {}
-      try { if (ctx) ctx.close(); } catch(e) {}
-      stream = ctx = an = osc = gain = null;
-      meter.style.width = '0';
-    }
-
-    async function begin(){
-      cleanup();
-      volOk = micOk = false; passed = false; lockStart();
-      setRow(volRow, 'run', '1'); setRow(micRow, '', '2');
-      volT.textContent = 'Playing a beep… keep your computer volume at 100% and use speakers (not headphones).';
-      scBtn.disabled = true; scBtn.textContent = 'Checking…';
-      try {
-        const id = devSel.value;
-        stream = await navigator.mediaDevices.getUserMedia({audio: Object.assign(
-          {echoCancellation:false, noiseSuppression:false, autoGainControl:false},
-          id ? {deviceId:{exact:id}} : {})});
-        // list microphones (labels only appear after permission is given)
-        try {
-          const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
-          if (devs.length > 1) {
-            const cur = (stream.getAudioTracks()[0].getSettings() || {}).deviceId || id;
-            devSel.innerHTML = '';
-            devs.forEach(d => { const o = document.createElement('option'); o.value = d.deviceId; o.textContent = d.label || 'Microphone'; if (d.deviceId === cur) o.selected = true; devSel.appendChild(o); });
-            devSel.style.display = 'block';
-          }
-        } catch(e) {}
-        ctx = new (window.AudioContext || window.webkitAudioContext)();
-        await ctx.resume();
-        an = ctx.createAnalyser(); an.fftSize = 4096; an.smoothingTimeConstant = 0;
-        ctx.createMediaStreamSource(stream).connect(an);
-      } catch (e) {
-        console.warn('Sound check mic error:', e);
-        cleanup();
-        setRow(volRow, 'bad', '!');
-        volT.textContent = 'The microphone could not be opened. Allow microphone access (and pick the right microphone), then press the button again.';
-        scBtn.disabled = false; scBtn.textContent = 'Try again';
-        showPop('Microphone not available', 'Please allow microphone access in the browser and make sure a microphone is connected. Then press "Try again".');
-        return;
-      }
-      running = true; scBtn.textContent = 'Checking…';
-      runVolumePhase();
-    }
-
-    function runVolumePhase(){
-      const sr = ctx.sampleRate, buf = new Float32Array(an.fftSize);
-      let bursts = 0, goodInRow = 0, failBursts = 0, lastDb = -120, phaseStart = 0, bestInBurst = -120, noiseDb = -120, state = 'quiet';
-      // Each cycle: 0.5 s silence (measure background) -> 0.8 s beep -> 0.4 s rest
-      function playBeep(){
-        try {
-          osc = ctx.createOscillator(); gain = ctx.createGain();
-          osc.type = 'sine'; osc.frequency.value = TONE_HZ;
-          gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-          gain.gain.linearRampToValueAtTime(0.9, ctx.currentTime + 0.05);
-          gain.gain.setValueAtTime(0.9, ctx.currentTime + 0.75);
-          gain.gain.linearRampToValueAtTime(0.0001, ctx.currentTime + 0.8);
-          osc.connect(gain); gain.connect(ctx.destination);
-          osc.start(); osc.stop(ctx.currentTime + 0.82);
-        } catch(e) {}
-      }
-      phaseStart = Date.now(); state = 'quiet'; noiseDb = -120;
-      timer = setInterval(() => {
-        if (!running) return;
-        an.getFloatTimeDomainData(buf);
-        const t = Date.now() - phaseStart;
-        const db = toneDb(buf, sr, TONE_HZ);
-        meter.style.width = Math.min(100, Math.max(0, (db + 70) * 100 / 55)) + '%';
-        if (state === 'quiet') {
-          noiseDb = Math.max(noiseDb, db);
-          if (t > 500) { state = 'beep'; phaseStart = Date.now(); bestInBurst = -120; playBeep(); }
-        } else if (state === 'beep') {
-          if (t > 150) bestInBurst = Math.max(bestInBurst, db);
-          if (t > 950) {
-            state = 'rest'; phaseStart = Date.now(); bursts++;
-            lastDb = bestInBurst;
-            const heard = bestInBurst >= minToneDb && (bestInBurst - noiseDb) >= 10;
-            if (heard) { goodInRow++; failBursts = 0; } else { goodInRow = 0; failBursts++; }
-            const shown = bestInBurst < -100 ? 'silence' : Math.round(bestInBurst) + ' dB';
-            if (goodInRow >= 2) {
-              volOk = true; setRow(volRow, 'ok', '✔');
-              volT.textContent = 'Volume is high enough (heard: ' + shown + '). Thank you.';
-              hidePop(); clearInterval(timer); timer = null; runMicPhase(); return;
-            }
-            setRow(volRow, 'bad', '!');
-            volT.textContent = 'The beep was too quiet (heard: ' + shown + ', need ' + minToneDb + ' dB). Turn your computer volume up to 100%, remove headphones, and wait — it re-checks by itself.';
-            if (failBursts >= 2 && Date.now() - popDismissedAt > 15000 && !pop.classList.contains('show')) {
-              showPop('Set your volume to 100%', 'Your computer volume is too low (or headphones are connected). Raise the system volume to 100% and use the speakers. The check repeats automatically and will continue as soon as the volume is high enough.');
-            }
-          }
-        } else if (state === 'rest') {
-          if (t > 450) { state = 'quiet'; phaseStart = Date.now(); noiseDb = -120; }
-        }
-      }, 100);
-    }
-
-    function runMicPhase(){
-      setRow(micRow, 'run', '2');
-      micT.textContent = 'Say “I am ready” aloud in your normal voice.';
-      const buf = new Float32Array(an.fftSize);
-      let loud = 0, start = Date.now(), nagged = false;
-      timer = setInterval(() => {
-        if (!running) return;
-        an.getFloatTimeDomainData(buf);
-        const lv = rms(buf);
-        meter.style.width = Math.min(100, lv * 100 / 0.12 * 1.0) + '%';
-        if (lv >= 0.012) loud++;
-        if (loud >= 8) {   // about 0.8 s of real speech in total
-          micOk = true; setRow(micRow, 'ok', '✔');
-          micT.textContent = 'Microphone works. Thank you.';
-          hidePop(); clearInterval(timer); timer = null; finish(); return;
-        }
-        if (Date.now() - start > 10000 && !nagged) {
-          nagged = true;
-          micT.textContent = 'We cannot hear you. Speak louder or closer, check the microphone choice below, or raise the microphone volume in your computer’s Sound settings.';
-          setRow(micRow, 'bad', '!');
-          showPop('We cannot hear you', 'Say “I am ready” aloud. If nothing is picked up, choose the correct microphone from the list or increase the microphone volume in Windows Sound settings. The check keeps listening.');
-        }
-      }, 100);
-    }
-
-    function finish(){
-      passed = volOk && micOk;
-      const chosen = devSel.style.display !== 'none' ? devSel.value : '';
-      cleanup();
-      if (passed) {
-        window.__aiAudioDeviceId = chosen || undefined;
-        scBtn.textContent = 'Sound check passed ✔'; scBtn.disabled = true; scBtn.style.background = '#16a34a';
-        unlockStart();
-      }
-    }
-
-    devSel.addEventListener('change', () => { if (!passed) begin(); });
-    scBtn.addEventListener('click', begin);
-
-    // Safety net if the exam is started some other way
-    window.__aiSoundCheckPassed = () => !required || passed;
-    window.__aiSoundCheckPopup = () => showPop('Sound check required', 'Complete the sound check first: computer volume at 100% (speakers) and a working microphone. The Start button unlocks automatically when both pass.');
-
-    fetch('/student/exam/preflight-config', {credentials:'same-origin', cache:'no-store'})
-      .then(r => r.ok ? r.json() : {})
-      .then(c => {
-        required = !(c && c.require_volume === false);
-        if (c && typeof c.min_tone_db === 'number') minToneDb = c.min_tone_db;
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!required) { unlockStart(); return; }
-        box.style.display = 'block';
-        lockStart();
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          setRow(volRow, 'bad', '!'); volT.textContent = 'This browser cannot use the microphone. Please open the exam in Microsoft Edge or Chrome.';
-          scBtn.disabled = true;
-        }
-      });
-  })();
-
   startBtn.addEventListener('click', async () => {
-    if (window.__aiSoundCheckPassed && !window.__aiSoundCheckPassed()) { if (window.__aiSoundCheckPopup) window.__aiSoundCheckPopup(); return; }
     startBtn.disabled = true;
     startBtn.textContent = 'Requesting camera access...';
 
